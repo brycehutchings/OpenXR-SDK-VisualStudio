@@ -16,8 +16,25 @@
 
 #include "pch.h"
 #include "App.h"
+#include <sstream>
+#include <winrt/Windows.Devices.h>
+#include <winrt/Windows.Devices.WiFi.h>
+#include <winrt/Windows.Storage.h>
+#include <winrt/Windows.Storage.Pickers.h>
+#include <winrt/Windows.Storage.Pickers.Provider.h>
+
+using namespace winrt::Windows::Devices::WiFi;
+using namespace winrt::Windows::Devices;
+using namespace winrt::Windows::Foundation::Collections;
+using namespace winrt::Windows::Storage;
+using namespace winrt::Windows::Storage::Pickers;
+
+using namespace winrt::Windows::Foundation;
 
 namespace {
+    std::wstringstream ss;
+    std::vector<std::tuple<WiFiAdapter, DateTime>> adapters;
+
     struct ImplementOpenXrProgram : xr::sample::IOpenXrProgram {
         ImplementOpenXrProgram(std::string applicationName, std::unique_ptr<xr::sample::IGraphicsPluginD3D11> graphicsPlugin)
             : m_applicationName(std::move(applicationName))
@@ -27,6 +44,13 @@ namespace {
         void Run() override {
             CreateInstance();
             CreateActions();
+
+            for (const auto& adapter : WiFiAdapter::FindAllAdaptersAsync().get()) {
+                adapter.ScanAsync().get();
+                adapters.push_back({adapter, DateTime{}});
+            }
+
+
 
             bool requestRestart = false;
             do {
@@ -162,7 +186,7 @@ namespace {
                     strcpy_s(actionInfo.localizedActionName, "Exit session");
                     actionInfo.countSubactionPaths = (uint32_t)m_subactionPaths.size();
                     actionInfo.subactionPaths = m_subactionPaths.data();
-                    CHECK_XRCMD(xrCreateAction(m_actionSet.Get(), &actionInfo, m_exitAction.Put()));
+                    CHECK_XRCMD(xrCreateAction(m_actionSet.Get(), &actionInfo, m_saveAction.Put()));
                 }
             }
 
@@ -175,8 +199,8 @@ namespace {
                 bindings.push_back({m_poseAction.Get(), GetXrPath("/user/hand/left/input/grip/pose")});
                 bindings.push_back({m_vibrateAction.Get(), GetXrPath("/user/hand/right/output/haptic")});
                 bindings.push_back({m_vibrateAction.Get(), GetXrPath("/user/hand/left/output/haptic")});
-                bindings.push_back({m_exitAction.Get(), GetXrPath("/user/hand/right/input/menu/click")});
-                bindings.push_back({m_exitAction.Get(), GetXrPath("/user/hand/left/input/menu/click")});
+                bindings.push_back({m_saveAction.Get(), GetXrPath("/user/hand/right/input/menu/click")});
+                bindings.push_back({m_saveAction.Get(), GetXrPath("/user/hand/left/input/menu/click")});
 
                 XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
                 suggestedBindings.interactionProfile = GetXrPath("/interaction_profiles/khr/simple_controller");
@@ -264,11 +288,8 @@ namespace {
                 spaceCreateInfo.poseInReferenceSpace = xr::math::Pose::Identity();
                 CHECK_XRCMD(xrCreateReferenceSpace(m_session.Get(), &spaceCreateInfo, m_sceneSpace.Put()));
 
-                // Initialize the placed cube 1 meter in front of user.
-                spaceCreateInfo.poseInReferenceSpace = xr::math::Pose::Translation({0, 0, -1});
-                CHECK_XRCMD(xrCreateReferenceSpace(m_session.Get(), &spaceCreateInfo, m_placedCubeSpace.Put()));
-                m_placedCube.Space = m_placedCubeSpace.Get();
-                m_placedCube.Scale = {0.1f, 0.1f, 0.1f};
+                spaceCreateInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+                CHECK_XRCMD(xrCreateReferenceSpace(m_session.Get(), &spaceCreateInfo, m_viewSpace.Put()));
             }
 
             // Create a space for each hand pointer pose.
@@ -536,25 +557,46 @@ namespace {
                         DEBUG_PRINT("Cube cannot be placed when positional tracking is lost.");
                     } else {
                         // Place the cube at the given location and time, and remember output placement space and anchor.
-                        PlaceHologramInScene(handLocation, placementTime, m_placedCubeSpace.Put(), m_placedCubeAnchor.Put());
-                        m_placedCube.Space = m_placedCubeSpace.Get();
+
+                        auto& newAnchor = m_placedCubeAnchors.emplace_back();
+                        auto& newSpace = m_placedCubeSpaces.emplace_back();
+                        auto& newCube = m_placedCubes.emplace_back();
+
+                        PlaceHologramInScene(handLocation, placementTime, newSpace.Put(), newAnchor.Put());
+                        newCube.Space = newSpace.Get();
                     }
 
                     ApplyVibration();
                 }
 
-                XrActionStateBoolean exitActionValue{XR_TYPE_ACTION_STATE_BOOLEAN};
+                XrActionStateBoolean saveActionValue{XR_TYPE_ACTION_STATE_BOOLEAN};
                 {
                     XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO};
-                    getInfo.action = m_exitAction.Get();
+                    getInfo.action = m_saveAction.Get();
                     getInfo.subactionPath = subactionPath;
-                    CHECK_XRCMD(xrGetActionStateBoolean(m_session.Get(), &getInfo, &exitActionValue));
+                    CHECK_XRCMD(xrGetActionStateBoolean(m_session.Get(), &getInfo, &saveActionValue));
                 }
 
                 // When menu button is released, request to quit the session, and therefore quit the application.
-                if (exitActionValue.isActive && exitActionValue.changedSinceLastSync && !exitActionValue.currentState) {
-                    CHECK_XRCMD(xrRequestExitSession(m_session.Get()));
-                    ApplyVibration();
+                if (saveActionValue.isActive && saveActionValue.changedSinceLastSync && !saveActionValue.currentState) {
+                    std::thread([&] {
+
+                        //FileSavePicker savePicker;
+                        //savePicker.SuggestedStartLocation(PickerLocationId::DocumentsLibrary);
+
+                        //IVector<winrt::hstring> coll{winrt::single_threaded_vector<winrt::hstring>()};
+                        //coll.Append(L".csv");
+
+                        //savePicker.FileTypeChoices().Insert(L"CSV", coll);
+                        //// Default file name if the user does not type one in or select a file to replace
+                        //savePicker.SuggestedFileName(L"Logs.csv");
+
+                        //StorageFile file = savePicker.PickSaveFileAsync().get();
+                        StorageFile file = KnownFolders::PicturesLibrary().CreateFileAsync(L"SpatialLog2.csv", CreationCollisionOption::GenerateUniqueName).get();
+                        if (file != nullptr) {
+                            FileIO::WriteTextAsync(file, winrt::hstring(ss.str().c_str())).get();
+                        }
+                    }).detach();
                 }
             }
         }
@@ -630,7 +672,7 @@ namespace {
             std::vector<xr::sample::Cube> visibleCubes;
 
             // Update cubes location with latest space relation
-            for (auto cube : {m_placedCube, m_cubesInHand[LeftSide], m_cubesInHand[RightSide]}) {
+            for (auto cube : {m_cubesInHand[LeftSide], m_cubesInHand[RightSide]}) {
                 if (cube.Space != XR_NULL_HANDLE) {
                     XrSpaceLocation spaceLocation{XR_TYPE_SPACE_LOCATION};
                     CHECK_XRCMD(xrLocateSpace(cube.Space, m_sceneSpace.Get(), predictedDisplayTime, &spaceLocation));
@@ -641,6 +683,49 @@ namespace {
                     }
                 }
             }
+
+            for (auto cube : m_placedCubes) {
+                XrSpaceLocation spaceLocation{XR_TYPE_SPACE_LOCATION};
+                CHECK_XRCMD(xrLocateSpace(cube.Space, m_sceneSpace.Get(), predictedDisplayTime, &spaceLocation));
+
+                if (xr::math::Pose::IsPoseValid(spaceLocation)) {
+                    cube.Pose = spaceLocation.pose;
+                    visibleCubes.push_back(cube);
+                }
+            }
+
+            int anchorId = 0;
+            for (auto cube : m_placedCubes) {
+                XrSpaceLocation spaceLocation{XR_TYPE_SPACE_LOCATION};
+                CHECK_XRCMD(xrLocateSpace(m_viewSpace.Get(), cube.Space, predictedDisplayTime, &spaceLocation));
+
+                if (xr::math::Pose::IsPoseValid(spaceLocation)) {
+                    ss << L"ANCHOR," << anchorId << L"," << spaceLocation.pose.position.x << L"," << spaceLocation.pose.position.y << L","
+                        << spaceLocation.pose.position.z << L","
+                        << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(spaceLocation.pose.position))) << L"\n";
+                }
+
+                anchorId++;
+            }
+
+            for (auto& adapter : adapters) {
+                const auto& networkReport = std::get<WiFiAdapter>(adapter).NetworkReport();
+                if (networkReport.Timestamp() != std::get<DateTime>(adapter)) {
+                    OutputDebugString(L"WiFi Updated\n");
+                    for (const auto& network : networkReport.AvailableNetworks())
+                    {
+                        ss << L"WIFI," << network.Ssid().c_str() << L"," << network.NetworkRssiInDecibelMilliwatts() << L"\n";
+                    }
+
+                    std::get<DateTime>(adapter) = networkReport.Timestamp();
+
+                    auto future = std::get<WiFiAdapter>(adapter).ScanAsync();
+                }
+            }
+            /*auto revoke = adapter.AvailableNetworksChanged(winrt::auto_revoke,
+    [](const WiFiAdapter& a, const auto&) {
+    });*/
+
 
             m_renderResources->ProjectionLayerViews.resize(viewCountOutput);
             if (m_optionalExtensions.DepthExtensionSupported) {
@@ -735,11 +820,12 @@ namespace {
         } m_optionalExtensions;
 
         xr::SpaceHandle m_sceneSpace;
+        xr::SpaceHandle m_viewSpace;
         XrReferenceSpaceType m_sceneSpaceType{};
 
-        xr::SpatialAnchorHandle m_placedCubeAnchor;
-        xr::SpaceHandle m_placedCubeSpace;
-        xr::sample::Cube m_placedCube; // Placed in local or anchor space.
+        std::vector<xr::SpatialAnchorHandle> m_placedCubeAnchors;
+        std::vector<xr::SpaceHandle> m_placedCubeSpaces;
+        std::vector<xr::sample::Cube> m_placedCubes;
 
         constexpr static uint32_t LeftSide = 0;
         constexpr static uint32_t RightSide = 1;
@@ -749,7 +835,7 @@ namespace {
 
         xr::ActionSetHandle m_actionSet;
         xr::ActionHandle m_placeAction;
-        xr::ActionHandle m_exitAction;
+        xr::ActionHandle m_saveAction;
         xr::ActionHandle m_poseAction;
         xr::ActionHandle m_vibrateAction;
 
