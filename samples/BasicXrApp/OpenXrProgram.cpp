@@ -22,6 +22,7 @@
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.Storage.Pickers.h>
 #include <winrt/Windows.Storage.Pickers.Provider.h>
+#include <limits>
 
 using namespace winrt::Windows::Devices::WiFi;
 using namespace winrt::Windows::Devices;
@@ -30,6 +31,13 @@ using namespace winrt::Windows::Storage;
 using namespace winrt::Windows::Storage::Pickers;
 
 using namespace winrt::Windows::Foundation;
+
+struct SignalSample {
+    XrVector3f Pos;
+    float DistEst;
+};
+
+std::vector<SignalSample> g_samples;
 
 namespace {
     std::wstringstream ss;
@@ -195,8 +203,8 @@ namespace {
                 std::vector<XrActionSuggestedBinding> bindings;
                 bindings.push_back({m_placeAction.Get(), GetXrPath("/user/hand/right/input/select/click")});
                 bindings.push_back({m_placeAction.Get(), GetXrPath("/user/hand/left/input/select/click")});
-                bindings.push_back({m_poseAction.Get(), GetXrPath("/user/hand/right/input/grip/pose")});
-                bindings.push_back({m_poseAction.Get(), GetXrPath("/user/hand/left/input/grip/pose")});
+                bindings.push_back({m_poseAction.Get(), GetXrPath("/user/hand/right/input/aim/pose")});
+                bindings.push_back({m_poseAction.Get(), GetXrPath("/user/hand/left/input/aim/pose")});
                 bindings.push_back({m_vibrateAction.Get(), GetXrPath("/user/hand/right/output/haptic")});
                 bindings.push_back({m_vibrateAction.Get(), GetXrPath("/user/hand/left/output/haptic")});
                 bindings.push_back({m_saveAction.Get(), GetXrPath("/user/hand/right/input/menu/click")});
@@ -296,7 +304,7 @@ namespace {
             for (uint32_t side : {LeftSide, RightSide}) {
                 XrActionSpaceCreateInfo createInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
                 createInfo.action = m_poseAction.Get();
-                createInfo.poseInActionSpace = xr::math::Pose::Identity();
+                createInfo.poseInActionSpace = xr::math::Pose::Translation(XrVector3f{0, 0, -0.1f});
                 createInfo.subactionPath = m_subactionPaths[side];
                 CHECK_XRCMD(xrCreateActionSpace(m_session.Get(), &createInfo, m_spacesInHand[side].Put()));
                 m_cubesInHand[side].Space = m_spacesInHand[side].Get();
@@ -583,6 +591,7 @@ namespace {
 
                         //FileSavePicker savePicker;
                         //savePicker.SuggestedStartLocation(PickerLocationId::DocumentsLibrary);
+                        winrt::array_view<int> foo;
 
                         //IVector<winrt::hstring> coll{winrt::single_threaded_vector<winrt::hstring>()};
                         //coll.Append(L".csv");
@@ -694,27 +703,85 @@ namespace {
                 }
             }
 
-            int anchorId = 0;
-            for (auto cube : m_placedCubes) {
-                XrSpaceLocation spaceLocation{XR_TYPE_SPACE_LOCATION};
-                CHECK_XRCMD(xrLocateSpace(m_viewSpace.Get(), cube.Space, predictedDisplayTime, &spaceLocation));
+            auto calculateDistance = [](float signalLevelInDb, float freqInMHz) {
+                double logFreq = (20 * log10(freqInMHz));
+                double exp = (27.55 - logFreq + abs(signalLevelInDb));
+                double exp20 = exp / 20.0f;
+                double p = pow(10.0, exp20);
+                return (float)p;
+            };
 
-                if (xr::math::Pose::IsPoseValid(spaceLocation)) {
-                    ss << L"ANCHOR," << anchorId << L"," << spaceLocation.pose.position.x << L"," << spaceLocation.pose.position.y << L","
-                        << spaceLocation.pose.position.z << L","
-                        << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(spaceLocation.pose.position))) << L"\n";
-                }
+            auto calculateSignalLevel = [](float p, float freqInMHz) {
+                double exp20 = log10(p);
+                double exp = exp20 * 20.0f;
+                double logFreq = (20 * log10(freqInMHz));
+                double signalLevelInDb = exp - 27.55 + logFreq;
+                return (float)-signalLevelInDb;
+            };
 
-                anchorId++;
-            }
-
+            bool wifiUpdated = false;
             for (auto& adapter : adapters) {
                 const auto& networkReport = std::get<WiFiAdapter>(adapter).NetworkReport();
                 if (networkReport.Timestamp() != std::get<DateTime>(adapter)) {
+                    wifiUpdated = true;
                     OutputDebugString(L"WiFi Updated\n");
                     for (const auto& network : networkReport.AvailableNetworks())
                     {
-                        ss << L"WIFI," << network.Ssid().c_str() << L"," << network.NetworkRssiInDecibelMilliwatts() << L"\n";
+                        if (network.Ssid() != L"Internets") {
+                        // && network.Ssid() != L"Internets2") {
+                            continue;
+                        }
+
+                        int anchorId = 0;
+                        for (auto cube : m_placedCubes) {
+                            {
+                                XrSpaceLocation cubeInView{XR_TYPE_SPACE_LOCATION};
+                                CHECK_XRCMD(xrLocateSpace(cube.Space, m_viewSpace.Get(), predictedDisplayTime, &cubeInView));
+                                if (xr::math::Pose::IsPoseValid(cubeInView)) {
+
+                                    float distanceEstimate =
+                                        calculateDistance(
+                                        (float)network.NetworkRssiInDecibelMilliwatts(),
+                                            network.ChannelCenterFrequencyInKilohertz() / 1000.0f);
+
+                                    const float actualDistance = DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)));
+
+                                    float signalEstimate = calculateSignalLevel(actualDistance,
+                                        network.ChannelCenterFrequencyInKilohertz() / 1000.0f);
+
+                                    ss << anchorId
+                                        << L"," << cubeInView.pose.position.x
+                                        << L"," << cubeInView.pose.position.y
+                                        << L"," << cubeInView.pose.position.z
+                                        << L"," << (atan2(cubeInView.pose.position.y, cubeInView.pose.position.x) * 180.0f / 3.1415926)
+                                        << L"," << network.Ssid().c_str()
+                                        << L"," << network.NetworkRssiInDecibelMilliwatts()
+                                        << L"," << (network.ChannelCenterFrequencyInKilohertz() / 1000)
+                                        << L"," << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)))
+                                        << L"," << distanceEstimate
+                                        << L"," << signalEstimate
+                                        << L"\n";
+
+                                    // TODO: Convert db to distance. Also put a actual distance to computed distance ratio? Meh.
+                                }
+                            }
+                            
+                            {
+                                XrSpaceLocation viewInWorld{XR_TYPE_SPACE_LOCATION};
+                                CHECK_XRCMD(xrLocateSpace(m_viewSpace.Get(), m_sceneSpace.Get(), predictedDisplayTime, &viewInWorld));
+                                if (xr::math::Pose::IsPoseValid(viewInWorld)) {
+
+                                    float distanceEstimate =
+                                        calculateDistance(
+                                        (float)network.NetworkRssiInDecibelMilliwatts(),
+                                            network.ChannelCenterFrequencyInKilohertz() / 1000.0f);
+
+                                    g_samples.push_back({viewInWorld.pose.position, distanceEstimate});
+                                }
+                            }
+
+                            anchorId++;
+                        }
                     }
 
                     std::get<DateTime>(adapter) = networkReport.Timestamp();
@@ -722,10 +789,24 @@ namespace {
                     auto future = std::get<WiFiAdapter>(adapter).ScanAsync();
                 }
             }
-            /*auto revoke = adapter.AvailableNetworksChanged(winrt::auto_revoke,
-    [](const WiFiAdapter& a, const auto&) {
-    });*/
 
+            //XrVector3f bestGuessPos;
+            //float bestGuessDiff = std::numeric_limits<float>::max();
+            /*
+            for (float x = -15; x <= 15; x++) {
+                for (float y = -15; y <= 15; y++) {
+                    for (float z = -15; z <= 15; z++) {
+                        DirectX::XMVECTOR gridPos = DirectX::XMVectorSet(x, y, z, 1);
+                        float dist = 0;
+                        for (const auto& sample : g_samples) {
+                            float distanceFromSample = gridPos - xr::math::LoadXrVector3(sample.Pos);
+                            float distanceDiff = abs(distanceFromSample - distanceEstimate);
+                            totalScore += distanceDiff;
+
+                        }
+                    }
+                }
+            }*/
 
             m_renderResources->ProjectionLayerViews.resize(viewCountOutput);
             if (m_optionalExtensions.DepthExtensionSupported) {
