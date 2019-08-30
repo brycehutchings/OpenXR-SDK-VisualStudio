@@ -23,6 +23,8 @@
 #include <winrt/Windows.Storage.Pickers.h>
 #include <winrt/Windows.Storage.Pickers.Provider.h>
 #include <limits>
+#include <d2d1_2.h>
+#include <dwrite_2.h>
 
 using namespace winrt::Windows::Devices::WiFi;
 using namespace winrt::Windows::Devices;
@@ -40,13 +42,140 @@ struct SignalSample {
 std::vector<SignalSample> g_samples;
 
 namespace {
+    struct TextSwapchain {
+        TextSwapchain(ID3D11Device* device, ID3D11DeviceContext* context, XrSession session) {
+            m_context.copy_from(context);
+
+            D2D1_FACTORY_OPTIONS options{};
+            CHECK_HRCMD(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, winrt::guid_of<ID2D1Factory2>(), &options, m_d2dFactory.put_void()));
+            CHECK_HRCMD(DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED, winrt::guid_of<IDWriteFactory2>(), reinterpret_cast<::IUnknown * *>(m_dwriteFactory.put_void())));
+
+            winrt::com_ptr<IDXGIDevice> dxgiDevice;
+            device->QueryInterface(winrt::guid_of< IDXGIDevice>(), dxgiDevice.put_void());
+            CHECK_HRCMD(m_d2dFactory->CreateDevice(dxgiDevice.get(), m_d2dDevice.put()));
+            CHECK_HRCMD(m_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, m_d2dContext.put()));
+
+            const D2D1_BITMAP_PROPERTIES1 bitmapProperties = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+            const auto texDesc =
+                CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_B8G8R8A8_UNORM, 512, 512, 1, 1, D3D11_BIND_RENDER_TARGET, D3D11_USAGE_DEFAULT, 0, 1, 0, 0);
+            CHECK_HRCMD(device->CreateTexture2D(&texDesc, nullptr, m_textDWriteTexture.put()));
+
+            winrt::com_ptr<IDXGISurface> dxgiPerfBuffer = m_textDWriteTexture.as<IDXGISurface>();
+            CHECK_HRCMD(m_d2dContext->CreateBitmapFromDxgiSurface(dxgiPerfBuffer.get(), &bitmapProperties, m_d2dTargetBitmap.put()));
+
+            m_d2dContext->SetTarget(m_d2dTargetBitmap.get());
+            m_d2dContext->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_ALIASED);
+            m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
+
+            CHECK_HRCMD(m_d2dContext->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), m_whiteBrush.put()));
+
+            CHECK_HRCMD(m_dwriteFactory->CreateTextFormat(L"Courier",
+                nullptr,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                18,
+                L"en-US",
+                m_textFormat.put()));
+            CHECK_HRCMD(m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER));
+            CHECK_HRCMD(m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER));
+
+            CHECK_HRCMD(m_d2dFactory->CreateDrawingStateBlock(m_stateBlock.put()));
+
+            XrSwapchainCreateInfo swapchainCreateInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+            swapchainCreateInfo.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            swapchainCreateInfo.width = 512;
+            swapchainCreateInfo.height = 512;
+            swapchainCreateInfo.arraySize = 1;
+            swapchainCreateInfo.sampleCount = 1;
+            swapchainCreateInfo.faceCount = 1;
+            swapchainCreateInfo.mipCount = 1;
+            swapchainCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+            CHECK_XRCMD(xrCreateSwapchain(session, &swapchainCreateInfo, m_textSwapchain.Put()));
+
+
+            uint32_t chainLength;
+            CHECK_XRCMD(xrEnumerateSwapchainImages(m_textSwapchain.Get(), 0, &chainLength, nullptr));
+
+            m_swapchainImages.resize(chainLength, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+            CHECK_XRCMD(xrEnumerateSwapchainImages(m_textSwapchain.Get(),
+                (uint32_t)m_swapchainImages.size(),
+                &chainLength,
+                reinterpret_cast<XrSwapchainImageBaseHeader*>(m_swapchainImages.data())));
+
+            UpdateText(L"BLANK");
+        }
+
+        XrSwapchain Swapchain() const { return m_textSwapchain.Get(); }
+
+        void UpdateText(std::wstring_view text) {
+            if (text == m_text) {
+                return;
+            }
+
+            m_text = text;
+
+            // Render text to the swapchain
+            uint32_t index;
+
+            XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            CHECK_XRCMD(xrAcquireSwapchainImage(m_textSwapchain.Get(), &acquireInfo, &index));
+
+            XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            waitInfo.timeout = XR_INFINITE_DURATION;
+            CHECK_XRCMD(xrWaitSwapchainImage(m_textSwapchain.Get(), &waitInfo));
+
+            m_d2dContext->SaveDrawingState(m_stateBlock.get());
+
+            const D2D1_SIZE_F renderTargetSize = m_d2dContext->GetSize();
+            m_d2dContext->BeginDraw();
+            m_d2dContext->Clear(0);
+            m_d2dContext->DrawText(m_text.c_str(),
+                static_cast<UINT32>(m_text.size()),
+                m_textFormat.get(),
+                D2D1::RectF(0.0f, 0.0f, renderTargetSize.width, renderTargetSize.height),
+                m_whiteBrush.get());
+
+            m_d2dContext->EndDraw();
+
+            m_d2dContext->RestoreDrawingState(m_stateBlock.get());
+
+            m_context->CopyResource(m_swapchainImages[index].texture, m_textDWriteTexture.get());
+
+            const XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            CHECK_XRCMD(xrReleaseSwapchainImage(m_textSwapchain.Get(), &releaseInfo));
+        }
+
+    private:
+        std::wstring m_text;
+        winrt::com_ptr<ID3D11DeviceContext> m_context;
+
+        xr::SwapchainHandle m_textSwapchain;
+        winrt::com_ptr<ID2D1Factory2> m_d2dFactory;
+        winrt::com_ptr<ID2D1Device1> m_d2dDevice;
+        winrt::com_ptr<ID2D1DeviceContext1> m_d2dContext;
+        winrt::com_ptr<ID2D1Bitmap1> m_d2dTargetBitmap;
+        winrt::com_ptr<ID2D1SolidColorBrush> m_whiteBrush;
+        winrt::com_ptr<ID2D1DrawingStateBlock> m_stateBlock;
+        winrt::com_ptr<IDWriteFactory2> m_dwriteFactory;
+        winrt::com_ptr<IDWriteTextFormat> m_textFormat;
+        winrt::com_ptr<ID3D11Texture2D> m_textDWriteTexture;
+
+        std::vector<XrSwapchainImageD3D11KHR> m_swapchainImages;
+
+    };
+
+
     std::wstringstream ss;
     std::vector<std::tuple<WiFiAdapter, DateTime>> adapters;
 
     struct ImplementOpenXrProgram : xr::sample::IOpenXrProgram {
         ImplementOpenXrProgram(std::string applicationName, std::unique_ptr<xr::sample::IGraphicsPluginD3D11> graphicsPlugin)
             : m_applicationName(std::move(applicationName))
-            , m_graphicsPlugin(std::move(graphicsPlugin)) {
+            , m_graphicsPlugin(std::move(graphicsPlugin))  {
         }
 
         void Run() override {
@@ -64,6 +193,10 @@ namespace {
             do {
                 InitializeSystem();
                 InitializeSession();
+
+                winrt::com_ptr<ID3D11DeviceContext> context;
+                m_graphicsPlugin->GetGraphicsBinding()->device->GetImmediateContext(context.put());
+                m_textSwapchain = std::make_unique<TextSwapchain>(m_graphicsPlugin->GetGraphicsBinding()->device, context.get(), m_session.Get());
 
                 while (true) {
                     bool exitRenderLoop = false;
@@ -625,14 +758,24 @@ namespace {
 
             // The projection layer consists of projection layer views.
             XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+            XrCompositionLayerQuad quadLayer{XR_TYPE_COMPOSITION_LAYER_QUAD};
 
             // Inform the runtime to consider alpha channel during composition
             layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            // quadLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 
             // Only render when session is visible. otherwise submit zero layers
             if (IsSessionVisible()) {
                 if (RenderLayer(frameState.predictedDisplayTime, layer)) {
                     layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
+
+                    quadLayer.pose.orientation.w = 1;
+                    quadLayer.pose.position = {0.35f, 0.35f, -2};
+                    quadLayer.size = {.3f, .3f};
+                    quadLayer.space = m_viewSpace.Get();
+                    quadLayer.subImage.swapchain = m_textSwapchain->Swapchain();
+                    quadLayer.subImage.imageRect = {{0,0},{512,512}};
+                    layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&quadLayer));
                 }
             }
 
@@ -753,7 +896,7 @@ namespace {
                                         << L"," << cubeInView.pose.position.x
                                         << L"," << cubeInView.pose.position.y
                                         << L"," << cubeInView.pose.position.z
-                                        << L"," << (atan2(cubeInView.pose.position.y, cubeInView.pose.position.x) * 180.0f / 3.1415926)
+                                        << L"," << abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926)
                                         << L"," << network.Ssid().c_str()
                                         << L"," << network.NetworkRssiInDecibelMilliwatts()
                                         << L"," << (network.ChannelCenterFrequencyInKilohertz() / 1000)
@@ -762,7 +905,19 @@ namespace {
                                         << L"," << signalEstimate
                                         << L"\n";
 
-                                    // TODO: Convert db to distance. Also put a actual distance to computed distance ratio? Meh.
+                                    if (anchorId == 0 && network.Ssid() == L"Internets") {
+                                        std::wstringstream row;
+                                        row
+                                            << L"X:" << cubeInView.pose.position.x << std::endl
+                                            << L"Y:" << cubeInView.pose.position.y << std::endl
+                                            << L"Z:" << cubeInView.pose.position.z << std::endl
+                                            << L"Ang:" << abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926) << std::endl
+                                            << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
+                                            << L"Dist:" << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position))) << std::endl
+                                            << L"dbEst:" << distanceEstimate << std::endl
+                                            << L"sigEst:" << signalEstimate << std::endl;
+                                        m_textSwapchain->UpdateText(row.str());
+                                    }
                                 }
                             }
                             
@@ -893,6 +1048,8 @@ namespace {
         xr::InstanceHandle m_instance;
         xr::SessionHandle m_session;
         uint64_t m_systemId{XR_NULL_SYSTEM_ID};
+
+        std::unique_ptr<TextSwapchain> m_textSwapchain;
 
         struct {
             bool DepthExtensionSupported{false};
