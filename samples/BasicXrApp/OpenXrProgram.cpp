@@ -17,6 +17,7 @@
 #include "pch.h"
 #include "App.h"
 #include <sstream>
+#include <iomanip>
 #include <winrt/Windows.Devices.h>
 #include <winrt/Windows.Devices.WiFi.h>
 #include <winrt/Windows.Storage.h>
@@ -431,13 +432,17 @@ namespace {
 
                 spaceCreateInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
                 CHECK_XRCMD(xrCreateReferenceSpace(m_session.Get(), &spaceCreateInfo, m_viewSpace.Put()));
+
+                spaceCreateInfo.poseInReferenceSpace.position.z = 0.19f; // Back of HoloLens 2 is roughly 19cm behind VIEW.
+                CHECK_XRCMD(xrCreateReferenceSpace(m_session.Get(), &spaceCreateInfo, m_wifiAdapterSpace.Put()));
+                
             }
 
             // Create a space for each hand pointer pose.
             for (uint32_t side : {LeftSide, RightSide}) {
                 XrActionSpaceCreateInfo createInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO};
                 createInfo.action = m_poseAction.Get();
-                createInfo.poseInActionSpace = xr::math::Pose::Translation(XrVector3f{0, 0, -0.1f});
+                createInfo.poseInActionSpace = xr::math::Pose::Translation(XrVector3f{0, 0, -0.2f});
                 createInfo.subactionPath = m_subactionPaths[side];
                 CHECK_XRCMD(xrCreateActionSpace(m_session.Get(), &createInfo, m_spacesInHand[side].Put()));
                 m_cubesInHand[side].Space = m_spacesInHand[side].Get();
@@ -724,7 +729,6 @@ namespace {
 
                         //FileSavePicker savePicker;
                         //savePicker.SuggestedStartLocation(PickerLocationId::DocumentsLibrary);
-                        winrt::array_view<int> foo;
 
                         //IVector<winrt::hstring> coll{winrt::single_threaded_vector<winrt::hstring>()};
                         //coll.Append(L".csv");
@@ -737,6 +741,7 @@ namespace {
                         StorageFile file = KnownFolders::PicturesLibrary().CreateFileAsync(L"SpatialLog2.csv", CreationCollisionOption::GenerateUniqueName).get();
                         if (file != nullptr) {
                             FileIO::WriteTextAsync(file, winrt::hstring(ss.str().c_str())).get();
+                            ::Sleep(2000);
                         }
                     }).detach();
                 }
@@ -762,7 +767,7 @@ namespace {
 
             // Inform the runtime to consider alpha channel during composition
             layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            // quadLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            quadLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 
             // Only render when session is visible. otherwise submit zero layers
             if (IsSessionVisible()) {
@@ -770,7 +775,7 @@ namespace {
                     layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
 
                     quadLayer.pose.orientation.w = 1;
-                    quadLayer.pose.position = {0.35f, 0.35f, -2};
+                    quadLayer.pose.position = {0.15f, 0.15f, -1.0f};
                     quadLayer.size = {.3f, .3f};
                     quadLayer.space = m_viewSpace.Get();
                     quadLayer.subImage.swapchain = m_textSwapchain->Swapchain();
@@ -846,6 +851,9 @@ namespace {
                 }
             }
 
+            // https://stackoverflow.com/questions/11217674/how-to-calculate-distance-from-wifi-router-using-signal-strength
+            // instead of 27.55, use 37-40 (0-180 degree mapping)
+            // instead of 10^ use 5^
             auto calculateDistance = [](float signalLevelInDb, float freqInMHz) {
                 double logFreq = (20 * log10(freqInMHz));
                 double exp = (27.55 - logFreq + abs(signalLevelInDb));
@@ -870,16 +878,31 @@ namespace {
                     OutputDebugString(L"WiFi Updated\n");
                     for (const auto& network : networkReport.AvailableNetworks())
                     {
-                        if (network.Ssid() != L"Internets") {
-                        // && network.Ssid() != L"Internets2") {
+                        std::wstring ssid = network.Ssid().c_str();
+                        if (ssid == L"") {
                             continue;
                         }
 
                         int anchorId = 0;
+
+                        //OutputDebugString(ssid.c_str());
+                        //OutputDebugString(L"\n");
+
                         for (auto cube : m_placedCubes) {
                             {
+                                if (anchorId == 0 && ssid != L"Internets") {
+
+                                    anchorId++;
+                                    continue;
+                                }
+
+                                if (anchorId == 1 && ssid != L"Internets2") {
+                                    anchorId++;
+                                    continue;
+                                }
+
                                 XrSpaceLocation cubeInView{XR_TYPE_SPACE_LOCATION};
-                                CHECK_XRCMD(xrLocateSpace(cube.Space, m_viewSpace.Get(), predictedDisplayTime, &cubeInView));
+                                CHECK_XRCMD(xrLocateSpace(cube.Space, m_wifiAdapterSpace.Get(), predictedDisplayTime, &cubeInView));
                                 if (xr::math::Pose::IsPoseValid(cubeInView)) {
 
                                     float distanceEstimate =
@@ -889,33 +912,33 @@ namespace {
 
                                     const float actualDistance = DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)));
 
-                                    float signalEstimate = calculateSignalLevel(actualDistance,
+                                    /*float signalEstimate = calculateSignalLevel(actualDistance,
                                         network.ChannelCenterFrequencyInKilohertz() / 1000.0f);
-
+                                        */
                                     ss << anchorId
-                                        << L"," << cubeInView.pose.position.x
-                                        << L"," << cubeInView.pose.position.y
-                                        << L"," << cubeInView.pose.position.z
-                                        << L"," << abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926)
+                                        //<< L"," << cubeInView.pose.position.x
+                                        //<< L"," << cubeInView.pose.position.y
+                                        //<< L"," << cubeInView.pose.position.z
+                                        << std::setprecision(4)
+                                        << L"," << (int)abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926)
                                         << L"," << network.Ssid().c_str()
                                         << L"," << network.NetworkRssiInDecibelMilliwatts()
                                         << L"," << (network.ChannelCenterFrequencyInKilohertz() / 1000)
-                                        << L"," << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)))
                                         << L"," << distanceEstimate
-                                        << L"," << signalEstimate
-                                        << L"\n";
+                                        << L"," << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)))
+                                        //<< L"," << signalEstimate
+                                        << std::endl;
 
                                     if (anchorId == 0 && network.Ssid() == L"Internets") {
                                         std::wstringstream row;
                                         row
-                                            << L"X:" << cubeInView.pose.position.x << std::endl
-                                            << L"Y:" << cubeInView.pose.position.y << std::endl
-                                            << L"Z:" << cubeInView.pose.position.z << std::endl
-                                            << L"Ang:" << abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926) << std::endl
+                                            << std::setprecision(4)
+                                            << L"Ang:" << (int)abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926) << std::endl
                                             << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
-                                            << L"Dist:" << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position))) << std::endl
                                             << L"dbEst:" << distanceEstimate << std::endl
-                                            << L"sigEst:" << signalEstimate << std::endl;
+                                            << L"Dist:" << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position))) << std::endl
+                                            //<< L"sigEst:" << signalEstimate
+                                            << std::endl;
                                         m_textSwapchain->UpdateText(row.str());
                                     }
                                 }
@@ -923,7 +946,7 @@ namespace {
                             
                             {
                                 XrSpaceLocation viewInWorld{XR_TYPE_SPACE_LOCATION};
-                                CHECK_XRCMD(xrLocateSpace(m_viewSpace.Get(), m_sceneSpace.Get(), predictedDisplayTime, &viewInWorld));
+                                CHECK_XRCMD(xrLocateSpace(m_wifiAdapterSpace.Get(), m_sceneSpace.Get(), predictedDisplayTime, &viewInWorld));
                                 if (xr::math::Pose::IsPoseValid(viewInWorld)) {
 
                                     float distanceEstimate =
@@ -1059,6 +1082,7 @@ namespace {
 
         xr::SpaceHandle m_sceneSpace;
         xr::SpaceHandle m_viewSpace;
+        xr::SpaceHandle m_wifiAdapterSpace;
         XrReferenceSpaceType m_sceneSpaceType{};
 
         std::vector<xr::SpatialAnchorHandle> m_placedCubeAnchors;
