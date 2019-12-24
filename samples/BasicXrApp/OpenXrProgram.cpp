@@ -36,11 +36,19 @@ using namespace winrt::Windows::Storage::Pickers;
 using namespace winrt::Windows::Foundation;
 
 struct SignalSample {
-    XrVector3f Pos;
-    float DistEst;
+    XrVector3f Position;
+    XrVector3f Forward;
+    float SignalStrength;
 };
 
-std::vector<SignalSample> g_samples;
+struct WirelessNetwork {
+    std::wstring Name;
+    int Frequency;
+};
+
+std::map<winrt::hstring, WirelessNetwork> g_wirelessNetworks;
+
+std::map<std::wstring, SignalSample> g_samples;
 
 namespace {
     struct TextSwapchain {
@@ -48,20 +56,22 @@ namespace {
             m_context.copy_from(context);
 
             D2D1_FACTORY_OPTIONS options{};
-            CHECK_HRCMD(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, winrt::guid_of<ID2D1Factory2>(), &options, m_d2dFactory.put_void()));
+            CHECK_HRCMD(
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, winrt::guid_of<ID2D1Factory2>(), &options, m_d2dFactory.put_void()));
             CHECK_HRCMD(DWriteCreateFactory(
-                DWRITE_FACTORY_TYPE_SHARED, winrt::guid_of<IDWriteFactory2>(), reinterpret_cast<::IUnknown * *>(m_dwriteFactory.put_void())));
+                DWRITE_FACTORY_TYPE_SHARED, winrt::guid_of<IDWriteFactory2>(), reinterpret_cast<::IUnknown**>(m_dwriteFactory.put_void())));
 
             winrt::com_ptr<IDXGIDevice> dxgiDevice;
-            device->QueryInterface(winrt::guid_of< IDXGIDevice>(), dxgiDevice.put_void());
+            device->QueryInterface(winrt::guid_of<IDXGIDevice>(), dxgiDevice.put_void());
             CHECK_HRCMD(m_d2dFactory->CreateDevice(dxgiDevice.get(), m_d2dDevice.put()));
             CHECK_HRCMD(m_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, m_d2dContext.put()));
 
-            const D2D1_BITMAP_PROPERTIES1 bitmapProperties = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            const D2D1_BITMAP_PROPERTIES1 bitmapProperties =
+                D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 
-            const auto texDesc =
-                CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_B8G8R8A8_UNORM, 512, 512, 1, 1, D3D11_BIND_RENDER_TARGET, D3D11_USAGE_DEFAULT, 0, 1, 0, 0);
+            const auto texDesc = CD3D11_TEXTURE2D_DESC(
+                DXGI_FORMAT_B8G8R8A8_UNORM, 512, 512, 1, 1, D3D11_BIND_RENDER_TARGET, D3D11_USAGE_DEFAULT, 0, 1, 0, 0);
             CHECK_HRCMD(device->CreateTexture2D(&texDesc, nullptr, m_textDWriteTexture.put()));
 
             winrt::com_ptr<IDXGISurface> dxgiPerfBuffer = m_textDWriteTexture.as<IDXGISurface>();
@@ -74,13 +84,13 @@ namespace {
             CHECK_HRCMD(m_d2dContext->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), m_whiteBrush.put()));
 
             CHECK_HRCMD(m_dwriteFactory->CreateTextFormat(L"Courier",
-                nullptr,
-                DWRITE_FONT_WEIGHT_BOLD,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                18,
-                L"en-US",
-                m_textFormat.put()));
+                                                          nullptr,
+                                                          DWRITE_FONT_WEIGHT_BOLD,
+                                                          DWRITE_FONT_STYLE_NORMAL,
+                                                          DWRITE_FONT_STRETCH_NORMAL,
+                                                          18,
+                                                          L"en-US",
+                                                          m_textFormat.put()));
             CHECK_HRCMD(m_textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER));
             CHECK_HRCMD(m_textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER));
 
@@ -97,20 +107,21 @@ namespace {
             swapchainCreateInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
             CHECK_XRCMD(xrCreateSwapchain(session, &swapchainCreateInfo, m_textSwapchain.Put()));
 
-
             uint32_t chainLength;
             CHECK_XRCMD(xrEnumerateSwapchainImages(m_textSwapchain.Get(), 0, &chainLength, nullptr));
 
             m_swapchainImages.resize(chainLength, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
             CHECK_XRCMD(xrEnumerateSwapchainImages(m_textSwapchain.Get(),
-                (uint32_t)m_swapchainImages.size(),
-                &chainLength,
-                reinterpret_cast<XrSwapchainImageBaseHeader*>(m_swapchainImages.data())));
+                                                   (uint32_t)m_swapchainImages.size(),
+                                                   &chainLength,
+                                                   reinterpret_cast<XrSwapchainImageBaseHeader*>(m_swapchainImages.data())));
 
             UpdateText(L"BLANK");
         }
 
-        XrSwapchain Swapchain() const { return m_textSwapchain.Get(); }
+        XrSwapchain Swapchain() const {
+            return m_textSwapchain.Get();
+        }
 
         void UpdateText(std::wstring_view text) {
             if (text == m_text) {
@@ -135,10 +146,10 @@ namespace {
             m_d2dContext->BeginDraw();
             m_d2dContext->Clear(0);
             m_d2dContext->DrawText(m_text.c_str(),
-                static_cast<UINT32>(m_text.size()),
-                m_textFormat.get(),
-                D2D1::RectF(0.0f, 0.0f, renderTargetSize.width, renderTargetSize.height),
-                m_whiteBrush.get());
+                                   static_cast<UINT32>(m_text.size()),
+                                   m_textFormat.get(),
+                                   D2D1::RectF(0.0f, 0.0f, renderTargetSize.width, renderTargetSize.height),
+                                   m_whiteBrush.get());
 
             m_d2dContext->EndDraw();
 
@@ -166,9 +177,7 @@ namespace {
         winrt::com_ptr<ID3D11Texture2D> m_textDWriteTexture;
 
         std::vector<XrSwapchainImageD3D11KHR> m_swapchainImages;
-
     };
-
 
     std::wstringstream ss;
     std::vector<std::tuple<WiFiAdapter, DateTime>> adapters;
@@ -176,7 +185,7 @@ namespace {
     struct ImplementOpenXrProgram : xr::sample::IOpenXrProgram {
         ImplementOpenXrProgram(std::string applicationName, std::unique_ptr<xr::sample::IGraphicsPluginD3D11> graphicsPlugin)
             : m_applicationName(std::move(applicationName))
-            , m_graphicsPlugin(std::move(graphicsPlugin))  {
+            , m_graphicsPlugin(std::move(graphicsPlugin)) {
         }
 
         void Run() override {
@@ -188,8 +197,6 @@ namespace {
                 adapters.push_back({adapter, DateTime{}});
             }
 
-
-
             bool requestRestart = false;
             do {
                 InitializeSystem();
@@ -197,7 +204,8 @@ namespace {
 
                 winrt::com_ptr<ID3D11DeviceContext> context;
                 m_graphicsPlugin->GetGraphicsBinding()->device->GetImmediateContext(context.put());
-                m_textSwapchain = std::make_unique<TextSwapchain>(m_graphicsPlugin->GetGraphicsBinding()->device, context.get(), m_session.Get());
+                m_textSwapchain =
+                    std::make_unique<TextSwapchain>(m_graphicsPlugin->GetGraphicsBinding()->device, context.get(), m_session.Get());
 
                 while (true) {
                     bool exitRenderLoop = false;
@@ -435,7 +443,6 @@ namespace {
 
                 spaceCreateInfo.poseInReferenceSpace.position.z = 0.19f; // Back of HoloLens 2 is roughly 19cm behind VIEW.
                 CHECK_XRCMD(xrCreateReferenceSpace(m_session.Get(), &spaceCreateInfo, m_wifiAdapterSpace.Put()));
-                
             }
 
             // Create a space for each hand pointer pose.
@@ -726,19 +733,17 @@ namespace {
                 // When menu button is released, request to quit the session, and therefore quit the application.
                 if (saveActionValue.isActive && saveActionValue.changedSinceLastSync && !saveActionValue.currentState) {
                     std::thread([&] {
+                        // FileSavePicker savePicker;
+                        // savePicker.SuggestedStartLocation(PickerLocationId::DocumentsLibrary);
+                        // IVector<winrt::hstring> coll{winrt::single_threaded_vector<winrt::hstring>()};
+                        // coll.Append(L".csv");
+                        // savePicker.FileTypeChoices().Insert(L"CSV", coll);
+                        // savePicker.SuggestedFileName(L"Logs.csv");
+                        // StorageFile file = savePicker.PickSaveFileAsync().get();
 
-                        //FileSavePicker savePicker;
-                        //savePicker.SuggestedStartLocation(PickerLocationId::DocumentsLibrary);
-
-                        //IVector<winrt::hstring> coll{winrt::single_threaded_vector<winrt::hstring>()};
-                        //coll.Append(L".csv");
-
-                        //savePicker.FileTypeChoices().Insert(L"CSV", coll);
-                        //// Default file name if the user does not type one in or select a file to replace
-                        //savePicker.SuggestedFileName(L"Logs.csv");
-
-                        //StorageFile file = savePicker.PickSaveFileAsync().get();
-                        StorageFile file = KnownFolders::PicturesLibrary().CreateFileAsync(L"SpatialLog2.csv", CreationCollisionOption::GenerateUniqueName).get();
+                        StorageFile file = KnownFolders::PicturesLibrary()
+                                               .CreateFileAsync(L"SpatialLog2.csv", CreationCollisionOption::GenerateUniqueName)
+                                               .get();
                         if (file != nullptr) {
                             FileIO::WriteTextAsync(file, winrt::hstring(ss.str().c_str())).get();
                             ::Sleep(2000);
@@ -779,7 +784,7 @@ namespace {
                     quadLayer.size = {.3f, .3f};
                     quadLayer.space = m_viewSpace.Get();
                     quadLayer.subImage.swapchain = m_textSwapchain->Swapchain();
-                    quadLayer.subImage.imageRect = {{0,0},{512,512}};
+                    quadLayer.subImage.imageRect = {{0, 0}, {512, 512}};
                     layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&quadLayer));
                 }
             }
@@ -851,6 +856,8 @@ namespace {
                 }
             }
 
+            // I think this code isn't going to be needed beacuse signal strength dB does not appear to be true dB.
+#if 0
             // https://stackoverflow.com/questions/11217674/how-to-calculate-distance-from-wifi-router-using-signal-strength
             // instead of 27.55, use 37-40 (0-180 degree mapping)
             // instead of 10^ use 5^
@@ -870,96 +877,36 @@ namespace {
                 return (float)-signalLevelInDb;
             };
 
+            // float signalEstimate = calculateSignalLevel(actualDistance, network.ChannelCenterFrequencyInKilohertz() / 1000.0f);
+#endif
+
+            XrSpaceLocation adapterInScene{XR_TYPE_SPACE_LOCATION};
+            CHECK_XRCMD(xrLocateSpace(m_wifiAdapterSpace.Get(), m_sceneSpace.Get(), predictedDisplayTime, &adapterInScene));
+
             bool wifiUpdated = false;
             for (auto& adapter : adapters) {
                 const auto& networkReport = std::get<WiFiAdapter>(adapter).NetworkReport();
                 if (networkReport.Timestamp() != std::get<DateTime>(adapter)) {
                     wifiUpdated = true;
                     OutputDebugString(L"WiFi Updated\n");
-                    for (const auto& network : networkReport.AvailableNetworks())
-                    {
+                    for (const auto& network : networkReport.AvailableNetworks()) {
+                        std::wstring networkDisplayName = network.Ssid().c_str();
+                        if (networkDisplayName == L"") {
+                            networkDisplayName = network.Bssid().c_str();
+                        }
+
+                        auto wirelessNetwork = g_wirelessNetworks.find(network.Bssid());
+                        if (wirelessNetwork == g_wirelessNetworks.end()) {
+                            g_wirelessNetworks.insert({network.Bssid(), WirelessNetwork { networkDisplayName, network.ChannelCenterFrequencyInKilohertz() / 1000 }});
+                        }
+
+
                         std::wstring ssid = network.Ssid().c_str();
-                        if (ssid == L"") {
-                            continue;
+                        if (networkDisplayName == L"") {
+                            networkDisplayName = network.Bssid().c_str();
                         }
 
-                        int anchorId = 0;
-
-                        //OutputDebugString(ssid.c_str());
-                        //OutputDebugString(L"\n");
-
-                        for (auto cube : m_placedCubes) {
-                            {
-                                if (anchorId == 0 && ssid != L"Internets") {
-
-                                    anchorId++;
-                                    continue;
-                                }
-
-                                if (anchorId == 1 && ssid != L"Internets2") {
-                                    anchorId++;
-                                    continue;
-                                }
-
-                                XrSpaceLocation cubeInView{XR_TYPE_SPACE_LOCATION};
-                                CHECK_XRCMD(xrLocateSpace(cube.Space, m_wifiAdapterSpace.Get(), predictedDisplayTime, &cubeInView));
-                                if (xr::math::Pose::IsPoseValid(cubeInView)) {
-
-                                    float distanceEstimate =
-                                        calculateDistance(
-                                        (float)network.NetworkRssiInDecibelMilliwatts(),
-                                            network.ChannelCenterFrequencyInKilohertz() / 1000.0f);
-
-                                    const float actualDistance = DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)));
-
-                                    /*float signalEstimate = calculateSignalLevel(actualDistance,
-                                        network.ChannelCenterFrequencyInKilohertz() / 1000.0f);
-                                        */
-                                    ss << anchorId
-                                        //<< L"," << cubeInView.pose.position.x
-                                        //<< L"," << cubeInView.pose.position.y
-                                        //<< L"," << cubeInView.pose.position.z
-                                        << std::setprecision(4)
-                                        << L"," << (int)abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926)
-                                        << L"," << network.Ssid().c_str()
-                                        << L"," << network.NetworkRssiInDecibelMilliwatts()
-                                        << L"," << (network.ChannelCenterFrequencyInKilohertz() / 1000)
-                                        << L"," << distanceEstimate
-                                        << L"," << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)))
-                                        //<< L"," << signalEstimate
-                                        << std::endl;
-
-                                    if (anchorId == 0 && network.Ssid() == L"Internets") {
-                                        std::wstringstream row;
-                                        row
-                                            << std::setprecision(4)
-                                            << L"Ang:" << (int)abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926) << std::endl
-                                            << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
-                                            << L"dbEst:" << distanceEstimate << std::endl
-                                            << L"Dist:" << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position))) << std::endl
-                                            //<< L"sigEst:" << signalEstimate
-                                            << std::endl;
-                                        m_textSwapchain->UpdateText(row.str());
-                                    }
-                                }
-                            }
-                            
-                            {
-                                XrSpaceLocation viewInWorld{XR_TYPE_SPACE_LOCATION};
-                                CHECK_XRCMD(xrLocateSpace(m_wifiAdapterSpace.Get(), m_sceneSpace.Get(), predictedDisplayTime, &viewInWorld));
-                                if (xr::math::Pose::IsPoseValid(viewInWorld)) {
-
-                                    float distanceEstimate =
-                                        calculateDistance(
-                                        (float)network.NetworkRssiInDecibelMilliwatts(),
-                                            network.ChannelCenterFrequencyInKilohertz() / 1000.0f);
-
-                                    g_samples.push_back({viewInWorld.pose.position, distanceEstimate});
-                                }
-                            }
-
-                            anchorId++;
-                        }
+                        LogNetworkUpdate(networkDisplayName, predictedDisplayTime, network);
                     }
 
                     std::get<DateTime>(adapter) = networkReport.Timestamp();
@@ -968,8 +915,8 @@ namespace {
                 }
             }
 
-            //XrVector3f bestGuessPos;
-            //float bestGuessDiff = std::numeric_limits<float>::max();
+            // XrVector3f bestGuessPos;
+            // float bestGuessDiff = std::numeric_limits<float>::max();
             /*
             for (float x = -15; x <= 15; x++) {
                 for (float y = -15; y <= 15; y++) {
@@ -1041,6 +988,50 @@ namespace {
             layer.viewCount = (uint32_t)m_renderResources->ProjectionLayerViews.size();
             layer.views = m_renderResources->ProjectionLayerViews.data();
             return true;
+        }
+
+        void LogNetworkUpdate(std::wstring& ssid,
+                              const XrTime& predictedDisplayTime,
+                              const winrt::Windows::Devices::WiFi::WiFiAvailableNetwork& network) {
+            int anchorId = 0;
+            for (auto cube : m_placedCubes) {
+                if (anchorId == 0 && ssid != L"Internets") {
+                    anchorId++;
+                    continue;
+                }
+
+                if (anchorId == 1 && ssid != L"Internets2") {
+                    anchorId++;
+                    continue;
+                }
+
+                XrSpaceLocation cubeInView{XR_TYPE_SPACE_LOCATION};
+                CHECK_XRCMD(xrLocateSpace(cube.Space, m_wifiAdapterSpace.Get(), predictedDisplayTime, &cubeInView));
+                if (xr::math::Pose::IsPoseValid(cubeInView)) {
+                    const float actualDistance =
+                        DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)));
+
+                    ss << anchorId << std::setprecision(4) << L","
+                       << (int)abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926) << L","
+                       << network.Ssid().c_str() << L"," << network.NetworkRssiInDecibelMilliwatts() << L","
+                       << (network.ChannelCenterFrequencyInKilohertz() / 1000) << L","
+                       << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)))
+                       << std::endl;
+
+                    if (anchorId == 0 && network.Ssid() == L"Internets") {
+                        std::wstringstream row;
+                        row << std::setprecision(4) << L"Ang:"
+                            << (int)abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926) << std::endl
+                            << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
+                            << L"Dist:"
+                            << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)))
+                            << std::endl;
+                        m_textSwapchain->UpdateText(row.str());
+                    }
+                }
+
+                anchorId++;
+            }
         }
 
         void PrepareSessionRestart() {
