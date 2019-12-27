@@ -16,6 +16,7 @@
 
 #include "pch.h"
 #include "App.h"
+#include <chrono>
 #include <sstream>
 #include <iomanip>
 #include <winrt/Windows.Devices.h>
@@ -26,6 +27,7 @@
 #include <limits>
 #include <d2d1_2.h>
 #include <dwrite_2.h>
+#include <DirectXMath.h>
 
 using namespace winrt::Windows::Devices::WiFi;
 using namespace winrt::Windows::Devices;
@@ -34,21 +36,39 @@ using namespace winrt::Windows::Storage;
 using namespace winrt::Windows::Storage::Pickers;
 
 using namespace winrt::Windows::Foundation;
+using namespace ::DirectX;
 
 struct SignalSample {
     XrVector3f Position;
-    XrVector3f Forward;
+    // l8r... XrVector3f Forward;
     float SignalStrength;
 };
 
-struct WirelessNetwork {
-    std::wstring Name;
-    int Frequency;
+struct LocationGuess {
+    XrVector3f Position;
+    float Score;
 };
 
-std::map<winrt::hstring, WirelessNetwork> g_wirelessNetworks;
+struct WirelessNetwork {
+    WirelessNetwork(std::wstring name, int frequency)
+        : Name(std::move(name))
+        , Frequency(frequency) {
+    }
+    WirelessNetwork(WirelessNetwork&&) = default;
+    WirelessNetwork& operator=(WirelessNetwork&&) = default;
 
-std::map<std::wstring, SignalSample> g_samples;
+    std::wstring Name;
+    int Frequency;
+    std::vector<SignalSample> Samples;
+    std::vector<LocationGuess> Guesses;
+};
+
+int g_saveCount = 0;
+int g_computeCount = 0;
+std::chrono::milliseconds g_computeTime{};
+
+std::mutex g_wirelessNetworksMutex;
+std::map<winrt::hstring, WirelessNetwork> g_wirelessNetworks;
 
 namespace {
     struct TextSwapchain {
@@ -197,6 +217,126 @@ namespace {
                 adapters.push_back({adapter, DateTime{}});
             }
 
+            bool exitRenderLoop = false;
+
+            auto computeThread = std::thread([&] {
+                while (true) {
+                    auto start = std::chrono::system_clock::now();
+                    {
+                        std::unique_lock mapLock(g_wirelessNetworksMutex);
+
+                        // auto it = g_wirelessNetworks.find(L"18:d6:c7:87:60:66"); // Internets2
+                        // if (it != g_wirelessNetworks.end()) {
+                        for (auto& wirelessNetworkPair : g_wirelessNetworks) {
+                            WirelessNetwork& wirelessNetwork = wirelessNetworkPair.second;
+
+                            std::vector<SignalSample> samples;
+                            {
+                                // std::unique_lock lock(g_wirelessNetworksMutex);
+                                samples = wirelessNetwork.Samples;
+                            }
+
+                            const int XCount = 30, YCount = 30, ZCount = 30;
+                            LocationGuess guesses[XCount][YCount][ZCount];
+
+                            float minScore = 1000000, maxScore = 0;
+                            for (int x = 0; x < XCount; x++) {
+                                for (int y = 0; y < YCount; y++) {
+                                    for (int z = 0; z < ZCount; z++) {
+                                        const XrVector3f voxelPos = {x - (XCount / 2.0f), y - (YCount / 2.0f), z - (ZCount / 2.0f)};
+
+                                        float totalDelta = 0;
+                                        for (const auto& sample : samples) {
+                                            float voxelDist = XMVectorGetX(XMVector3Length(XMVectorSubtract(
+                                                xr::math::LoadXrVector3(voxelPos), xr::math::LoadXrVector3(sample.Position))));
+
+                                            float predictDistance;
+                                            {
+                                                predictDistance = (-0.3f * sample.SignalStrength) - 7.9f;
+                                                predictDistance = predictDistance < 0 ? 0 : predictDistance;
+                                            }
+
+                                            float predictOffset = fabs(predictDistance - voxelDist);
+                                            totalDelta += predictOffset;
+                                        }
+
+                                        guesses[x][y][z].Position = voxelPos;
+                                        guesses[x][y][z].Score = totalDelta;
+
+                                        minScore = std::min(minScore, totalDelta);
+                                        maxScore = std::max(maxScore, totalDelta);
+                                    }
+                                }
+                            }
+
+                            std::vector<LocationGuess> localMinima;
+
+                            if (minScore != maxScore) {
+                                XMVECTOR avgPos = XMVectorSet(0, 0, 0, 0);
+                                int count = 0;
+                                for (int x = 0; x < XCount; x++) {
+                                    for (int y = 0; y < YCount; y++) {
+                                        for (int z = 0; z < ZCount; z++) {
+                                            float weight = 1.0f - (guesses[x][y][z].Score - minScore) / (maxScore - minScore);
+                                            avgPos = XMVectorAdd(avgPos,
+                                                                 XMVectorScale(xr::math::LoadXrVector3(guesses[x][y][z].Position), weight));
+                                            count++;
+                                        }
+                                    }
+                                }
+
+                                //avgPos = XMVectorScale(avgPos, 1 / (float)count);
+                                localMinima.push_back({ {XMVectorGetX(avgPos), XMVectorGetY(avgPos), XMVectorGetZ(avgPos)}, 1.0f });
+                            }
+
+                            //#if 0
+                            /*
+                            get min and max cell value and normalize to that range, inverse (0 = worst, 1 = best)
+                            sum up all cell positions multiplied by inverse range
+                            multiply the final position by 1/count to get weighted average
+                            */
+
+                            // Find local minima
+                            for (int x = 1; x < XCount - 1; x++) {
+                                for (int y = 1; y < YCount - 1; y++) {
+                                    for (int z = 1; z < ZCount - 1; z++) {
+                                        // TODO: Do diagonal neighbors too
+                                        float me = guesses[x][y][z].Score;
+                                        if (me < guesses[x - 1][y][z].Score && me < guesses[x - 1][y - 1][z].Score &&
+                                            me < guesses[x - 1][y + 1][z].Score && me < guesses[x - 1][y][z - 1].Score &&
+                                            me < guesses[x - 1][y][z + 1].Score && me < guesses[x + 1][y][z].Score &&
+                                            me < guesses[x + 1][y - 1][z].Score && me < guesses[x + 1][y + 1][z].Score &&
+                                            me < guesses[x + 1][y][z - 1].Score && me < guesses[x + 1][y][z + 1].Score &&
+                                            me < guesses[x][y - 1][z].Score && me < guesses[x][y + 1][z].Score &&
+                                            me < guesses[x][y][z - 1].Score && me < guesses[x][y][z + 1].Score) {
+                                            guesses[x][y][z].Score = 0.20f;
+                                            localMinima.push_back(guesses[x][y][z]);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Exclude any local minima that are too much worse than the best guess.
+                            localMinima.erase(std::remove_if(localMinima.begin(),
+                                                             localMinima.end(),
+                                                             [&](const auto& lm) { return lm.Score > minScore * 1.15f; }),
+                                              localMinima.end());
+                            //#endif
+
+                            {
+                                // std::unique_lock lock(g_wirelessNetworksMutex);
+                                wirelessNetwork.Guesses = std::move(localMinima);
+                            }
+                        }
+
+                        g_computeCount++;
+                        g_computeTime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - start);
+                    }
+
+                    ::Sleep(2000);
+                }
+            });
+
             bool requestRestart = false;
             do {
                 InitializeSystem();
@@ -208,7 +348,6 @@ namespace {
                     std::make_unique<TextSwapchain>(m_graphicsPlugin->GetGraphicsBinding()->device, context.get(), m_session.Get());
 
                 while (true) {
-                    bool exitRenderLoop = false;
                     ProcessEvents(&exitRenderLoop, &requestRestart);
                     if (exitRenderLoop) {
                         break;
@@ -228,6 +367,8 @@ namespace {
                     PrepareSessionRestart();
                 }
             } while (requestRestart);
+
+            // computeThread.join();
         }
 
     private:
@@ -624,10 +765,12 @@ namespace {
             }
         }
 
-        void PlaceHologramInScene(const XrSpaceLocation& location,
+        void PlaceHologramInScene(XrSpaceLocation location,
                                   XrTime placementTime,
                                   XrSpace* placementSpace,
                                   XrSpatialAnchorMSFT* placementAnchor) const {
+            location.pose = {{0, 0, 0, 1}, location.pose.position}; // identity orientation so that it is gravity aligned.
+
             if (m_optionalExtensions.SpatialAnchorSupported) {
                 // Anchors provide the best stability when moving beyond 5 meters, so if the extension is enabled,
                 // create an anchor at the hand location and use the resulting anchor space.
@@ -730,7 +873,6 @@ namespace {
                     CHECK_XRCMD(xrGetActionStateBoolean(m_session.Get(), &getInfo, &saveActionValue));
                 }
 
-                // When menu button is released, request to quit the session, and therefore quit the application.
                 if (saveActionValue.isActive && saveActionValue.changedSinceLastSync && !saveActionValue.currentState) {
                     std::thread([&] {
                         // FileSavePicker savePicker;
@@ -742,11 +884,11 @@ namespace {
                         // StorageFile file = savePicker.PickSaveFileAsync().get();
 
                         StorageFile file = KnownFolders::PicturesLibrary()
-                                               .CreateFileAsync(L"SpatialLog2.csv", CreationCollisionOption::GenerateUniqueName)
+                                               .CreateFileAsync(L"SpatialLog.csv", CreationCollisionOption::GenerateUniqueName)
                                                .get();
                         if (file != nullptr) {
                             FileIO::WriteTextAsync(file, winrt::hstring(ss.str().c_str())).get();
-                            ::Sleep(2000);
+                            g_saveCount++;
                         }
                     }).detach();
                 }
@@ -856,6 +998,34 @@ namespace {
                 }
             }
 
+            // Render sample locations.
+            {
+                std::unique_lock lock(g_wirelessNetworksMutex);
+                for (const auto& wirelessNetwork : g_wirelessNetworks) {
+                    for (const auto& sample : wirelessNetwork.second.Samples) {
+                        xr::sample::Cube cube;
+                        cube.Scale = {0.02f, 0.02f, 0.02f};
+                        cube.Pose.orientation = {0, 0, 0, 1};
+                        cube.Pose.position = sample.Position;
+                        visibleCubes.push_back(cube);
+                    }
+                }
+            }
+
+            // Render guesses locations.
+            {
+                std::unique_lock lock(g_wirelessNetworksMutex);
+                for (const auto& wirelessNetwork : g_wirelessNetworks) {
+                    for (const auto& guess : wirelessNetwork.second.Guesses) {
+                        xr::sample::Cube cube;
+                        cube.Scale = {guess.Score, guess.Score, guess.Score};
+                        cube.Pose.orientation = {0, 0, 0, 1};
+                        cube.Pose.position = guess.Position;
+                        visibleCubes.push_back(cube);
+                    }
+                }
+            }
+
             // I think this code isn't going to be needed beacuse signal strength dB does not appear to be true dB.
 #if 0
             // https://stackoverflow.com/questions/11217674/how-to-calculate-distance-from-wifi-router-using-signal-strength
@@ -895,18 +1065,17 @@ namespace {
                             networkDisplayName = network.Bssid().c_str();
                         }
 
-                        auto wirelessNetwork = g_wirelessNetworks.find(network.Bssid());
-                        if (wirelessNetwork == g_wirelessNetworks.end()) {
-                            g_wirelessNetworks.insert({network.Bssid(), WirelessNetwork { networkDisplayName, network.ChannelCenterFrequencyInKilohertz() / 1000 }});
+                        if (networkDisplayName != L"Internets" && networkDisplayName != L"Internets2") {
+                            continue;
                         }
 
-
-                        std::wstring ssid = network.Ssid().c_str();
-                        if (networkDisplayName == L"") {
-                            networkDisplayName = network.Bssid().c_str();
+                        auto wirelessNetworkIt = g_wirelessNetworks.find(network.Bssid());
+                        if (wirelessNetworkIt == g_wirelessNetworks.end()) {
+                            WirelessNetwork wirelessNetwork(networkDisplayName, network.ChannelCenterFrequencyInKilohertz() / 1000);
+                            wirelessNetworkIt = g_wirelessNetworks.insert({network.Bssid(), std::move(wirelessNetwork)}).first;
                         }
 
-                        LogNetworkUpdate(networkDisplayName, predictedDisplayTime, network);
+                        LogNetworkUpdate(wirelessNetworkIt->second, predictedDisplayTime, network);
                     }
 
                     std::get<DateTime>(adapter) = networkReport.Timestamp();
@@ -921,7 +1090,7 @@ namespace {
             for (float x = -15; x <= 15; x++) {
                 for (float y = -15; y <= 15; y++) {
                     for (float z = -15; z <= 15; z++) {
-                        DirectX::XMVECTOR gridPos = DirectX::XMVectorSet(x, y, z, 1);
+                        XMVECTOR gridPos = XMVectorSet(x, y, z, 1);
                         float dist = 0;
                         for (const auto& sample : g_samples) {
                             float distanceFromSample = gridPos - xr::math::LoadXrVector3(sample.Pos);
@@ -990,42 +1159,60 @@ namespace {
             return true;
         }
 
-        void LogNetworkUpdate(std::wstring& ssid,
+        void LogNetworkUpdate(WirelessNetwork& wirelessNetwork,
                               const XrTime& predictedDisplayTime,
                               const winrt::Windows::Devices::WiFi::WiFiAvailableNetwork& network) {
+            XrSpaceLocation adapterInScene{XR_TYPE_SPACE_LOCATION};
+            CHECK_XRCMD(xrLocateSpace(m_wifiAdapterSpace.Get(), m_sceneSpace.Get(), predictedDisplayTime, &adapterInScene));
+            if (xr::math::Pose::IsPoseValid(adapterInScene)) {
+                auto& sample = wirelessNetwork.Samples.emplace_back();
+                sample.Position = adapterInScene.pose.position;
+                sample.SignalStrength = (float)network.NetworkRssiInDecibelMilliwatts();
+            }
+
             int anchorId = 0;
             for (auto cube : m_placedCubes) {
-                if (anchorId == 0 && ssid != L"Internets") {
+                if (anchorId == 0 && wirelessNetwork.Name != L"Internets") {
                     anchorId++;
                     continue;
                 }
 
-                if (anchorId == 1 && ssid != L"Internets2") {
+                if (anchorId == 1 && wirelessNetwork.Name != L"Internets2") {
                     anchorId++;
                     continue;
                 }
 
-                XrSpaceLocation cubeInView{XR_TYPE_SPACE_LOCATION};
-                CHECK_XRCMD(xrLocateSpace(cube.Space, m_wifiAdapterSpace.Get(), predictedDisplayTime, &cubeInView));
-                if (xr::math::Pose::IsPoseValid(cubeInView)) {
-                    const float actualDistance =
-                        DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)));
+                if (anchorId > 1) {
+                    continue;
+                }
 
-                    ss << anchorId << std::setprecision(4) << L","
-                       << (int)abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926) << L","
-                       << network.Ssid().c_str() << L"," << network.NetworkRssiInDecibelMilliwatts() << L","
-                       << (network.ChannelCenterFrequencyInKilohertz() / 1000) << L","
-                       << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)))
+                XrSpaceLocation adapterInCube{XR_TYPE_SPACE_LOCATION};
+                CHECK_XRCMD(xrLocateSpace(m_wifiAdapterSpace.Get(), cube.Space, predictedDisplayTime, &adapterInCube));
+                if (xr::math::Pose::IsPoseValid(adapterInCube)) {
+                    auto cubeDirection = XMVector3Normalize(XMVectorNegate(xr::math::LoadXrVector3(adapterInCube.pose.position)));
+
+                    XMVECTORF32 wifiForward = {{{0, 0, 1}}};
+                    auto forwardDirection = XMVector3Rotate(wifiForward, xr::math::LoadXrQuaternion(adapterInCube.pose.orientation));
+                    float cosAngleFromCube = XMVectorGetX(XMVector3Dot(cubeDirection, forwardDirection)); // = cos(angle)
+                    float angleFromCube = acos(cosAngleFromCube) / 3.1415926f * 180;
+
+                    ss << anchorId << std::setprecision(4) << L"," << adapterInCube.pose.position.x << L"," << adapterInCube.pose.position.y
+                       << L"," << adapterInCube.pose.position.z << L"," << angleFromCube << L"," << network.Ssid().c_str() << L","
+                       << network.NetworkRssiInDecibelMilliwatts() << L"," << (network.ChannelCenterFrequencyInKilohertz() / 1000) << L","
                        << std::endl;
 
-                    if (anchorId == 0 && network.Ssid() == L"Internets") {
+                    // negate(normalize(position)) is the direction to the ssid
+                    // adapterInCube.pose.orientation
+
+                    if (anchorId == 0 && network.Ssid() == L"Internets2") {
                         std::wstringstream row;
-                        row << std::setprecision(4) << L"Ang:"
-                            << (int)abs(atan2(cubeInView.pose.position.x, -cubeInView.pose.position.z) * 180.0f / 3.1415926) << std::endl
+                        row << std::setprecision(4) << L"Ang:" << angleFromCube << std::endl
                             << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
-                            << L"Dist:"
-                            << DirectX::XMVectorGetX(DirectX::XMVector3Length(xr::math::LoadXrVector3(cubeInView.pose.position)))
-                            << std::endl;
+                            << L"Dist:" << XMVectorGetX(XMVector3Length(xr::math::LoadXrVector3(adapterInCube.pose.position))) << std::endl
+                            << L"Saves:" << g_saveCount << std::endl
+                            << L"CTime:" << g_computeTime.count() << std::endl
+                            << L"Compute:" << g_computeCount << std::endl;
+
                         m_textSwapchain->UpdateText(row.str());
                     }
                 }
