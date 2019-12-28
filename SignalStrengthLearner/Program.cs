@@ -1,4 +1,4 @@
-﻿#define LINEAR
+﻿#define POWERSOLVER2
 
 using System;
 using System.Collections.Generic;
@@ -54,7 +54,7 @@ namespace SignalStrengthLearner
 
         static void Main(string[] args)
         {
-            string signalDataPath = @"C:\Git\Work\OpenXR-SDK-VisualStudio.brycehutchings\Data\SpatialLog (13).csv";
+            string signalDataPath = @"C:\Git\Work\OpenXR-SDK-VisualStudio.brycehutchings\Data\SpatialLog (25).csv";
 
             ILookup<string, SignalData> signalData = System.IO.File.ReadAllLines(signalDataPath)
                 .Select(l =>
@@ -66,7 +66,7 @@ namespace SignalStrengthLearner
 
                     return new SignalData
                     {
-                        NormAngle = float.Parse(tokens[4]) / 180.0f, // for 0 .... 1 range
+                        NormAngle = float.Parse(tokens[4]),
                         Ssid = tokens[5],
                         SignalStrength = int.Parse(tokens[6]),
                         Frequency = int.Parse(tokens[7]),
@@ -76,6 +76,7 @@ namespace SignalStrengthLearner
                 })
                 .ToLookup(s => s.Ssid);
 
+#if GUESS
             using (var result = File.CreateText("Result.csv"))
             {
                 result.WriteLine($"x,y,z,offset,guessdelta,guessdelta2,count2,count3");
@@ -140,7 +141,7 @@ namespace SignalStrengthLearner
                     }
                 }
             }
-
+#endif
 
             using (var result = File.CreateText("LearnScore.csv"))
             {
@@ -153,11 +154,19 @@ namespace SignalStrengthLearner
                     Console.WriteLine($"Avg={avgOffset} AbsAvg={avgAbsOffset} (3.13 Best)");
                 }
 #endif
+
 #if LINEAR
-                // -0.3, -8, -1
-                // -0.26, -5.1, -0.5 (Internets)
-                // -0.3, -7.8, -1.2 (Internets2)
-                for (float m = -0.35f; m < -0.25f; m += 0.01f)
+                // Linear is very good except at 20-30 dB where it curves a bit
+                // For this reason, a POWER estimate is better
+                /*
+                 * SpatialLog (25).csv
+                 * 0.18,5.01                            -0.27	-6	-1.8
+                 * 0.12,5.03                            -0.28	-6.6	-1.7
+                 * 0.07,5.06                            -0.29	-7.1	-1.8
+                 * 0.02,5.11                            -0.3	-7.6	-1.8    <----Best trade off between avg offset and r-squared
+                 * 0.01,5.98                            -0.31	-9.8	1.4
+                */
+                for (float m = -0.35f; m < -0.20f; m += 0.01f)
                 {
                     Console.WriteLine(m);
                     for (float b = -15.0f; b < -5.0f; b += 0.1f)
@@ -242,20 +251,40 @@ namespace SignalStrengthLearner
 #endif
 #if POWERSOLVER2
                 // Optimal:  A=2.41, B=0.00054, C=-0.049, 0.0002
-                // AngNorm = Ang/180
-                // 0.00054f * POW(ABS(dB) + AngNorm * 2.9, 2.41f)
-                // UGH WHAT
 
-                for (float a = 2.3f; a < 2.5f; a += 0.01f)
+                // Lowest r-Squared:
+                // 1.99	0.0029	-5.7	Internets	0.21	7.454	Internets2	0.01	2.574	Avg	0.11	5.01
+                // 1.9	0.0042	-6.2	Internets	0.24	7.402	Internets2	0.07	2.585	Avg	0.16	4.99
+                // 1.94	0.0036	-5.8	Internets	0.11	7.402	Internets2	0.12	2.586	Avg	0.11	4.99
+
+                // Best Trade-Off?
+                // 1.98	0.0031	-6.2	Internets	0.06	7.444	Internets2	0.09	2.579	Avg	0.07	5.01
+                // 2.02	0.0027	-7.2	Internets	0   	7.524	Internets2	0.04	2.585	Avg	0.02	5.05 <---
+
+                // Lowest Avg Delta:
+                // 2.05	0.0024	-7.4	Internets	0.01	7.57	Internets2	0	    2.588	Avg	0	    5.08
+                // 2.04	0.0025	-7.4	Internets	0	7.558	    Internets2	0.01	2.588	Avg	0.01	5.07
+
+                // 20-30db: 0-1m
+                // 30-40db: 0-4m
+                // 40-50db: 0-5m
+                // 50-60db: 0-6m
+                // 60-70db: 0-7m
+                // 70-80db: 0-8m
+                // therefore...
+                // maxOffset = db / 10
+                // Average offset is 0.0496*dB - 0.8449
+
+
+                for (float a = 1.9f; a < 2.1f; a += 0.02f)
                 {
                     Console.WriteLine(a);
-                    for (float b = 0.0005f; b < 0.0007f; b += 0.00001f)
+                    for (float b = 0.0015f; b < 0.005f; b += 0.0001f)
                     {
-                        for (float c = -20.0f; c <= 20.0f; c += 0.1f)
+                        for (float c = -20.0f; c <= 0.0f; c += 0.2f)
                         {
-                            string row = $"{a:N2}\t{b:N5}\t{c:N2}";
+                            string row = $"{a:N2},{b:N5},{c:N2}";
 
-                            bool outOfRange = false;
                             float avgOffsetTotal = 0, rSquaredTotal = 0;
                             foreach (var grouping in signalData)
                             {
@@ -263,27 +292,21 @@ namespace SignalStrengthLearner
                                 var avgOffset = Math.Abs(offsets.Average());
                                 var rSquared = offsets.Average(o => o * o);
 
-                                if (avgOffset > 0.3f || rSquared > 8.0f)
-                                {
-                                    outOfRange = true;
-                                    break;
-                                }
-
                                 avgOffsetTotal += avgOffset;
                                 rSquaredTotal += rSquared;
 
-                                row += $"\t{grouping.Key}\t{avgOffset:N2}\t{rSquared:N3}";
+                                row += $",{grouping.Key},{avgOffset:N2},{rSquared:N3}";
                             }
 
                             avgOffsetTotal /= signalData.Count();
                             rSquaredTotal /= signalData.Count();
 
-                            if (outOfRange || avgOffsetTotal > 0.25f || rSquaredTotal > 5)
+                            if (rSquaredTotal > 5.5f || avgOffsetTotal > 0.3f)
                             {
                                 continue;
                             }
 
-                            row += $"\tAvg\t{avgOffsetTotal:N2}\t{rSquaredTotal:N2}";
+                            row += $",Avg,{avgOffsetTotal:N2},{rSquaredTotal:N2}";
                             result.WriteLine(row);
 
                         }

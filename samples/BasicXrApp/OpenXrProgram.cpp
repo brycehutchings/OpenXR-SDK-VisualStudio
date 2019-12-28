@@ -14,6 +14,14 @@
 //
 //*********************************************************
 
+/* Bayes https://en.wikipedia.org/wiki/Naive_Bayes_spam_filtering
+public static double CombineProbabilities(IEnumerable<double> probabilities)
+{
+    // Combine probabilities in the log domain to avoid underflow.
+    return 1 / (1 + Math.Exp(probabilities.Sum(a = > Math.Log(1 - a) - Math.Log(a))));
+}
+*/
+
 #include "pch.h"
 #include "App.h"
 #include <chrono>
@@ -29,6 +37,9 @@
 #include <dwrite_2.h>
 #include <DirectXMath.h>
 
+#define POWER
+#define PREDICT
+
 using namespace winrt::Windows::Devices::WiFi;
 using namespace winrt::Windows::Devices;
 using namespace winrt::Windows::Foundation::Collections;
@@ -40,7 +51,7 @@ using namespace ::DirectX;
 
 struct SignalSample {
     XrVector3f Position;
-    // l8r... XrVector3f Forward;
+    XrVector3f Forward;
     float SignalStrength;
 };
 
@@ -69,6 +80,22 @@ std::chrono::milliseconds g_computeTime{};
 
 std::mutex g_wirelessNetworksMutex;
 std::map<winrt::hstring, WirelessNetwork> g_wirelessNetworks;
+
+#ifdef LINEAR // Linear is not so good at the 20-30db range.
+float PredictDistance(float signalStrength) {
+    // Better but requires normalized angle: (-0.30 * strength) + (normAngle * -1.1) - 7.9
+    float predictDistance = (-0.31f * signalStrength) - 9.1f;
+    predictDistance = predictDistance < 0 ? 0 : predictDistance;
+    return predictDistance;
+}
+#endif
+#ifdef POWER
+float PredictDistance(float signalStrength, float normAngle) {
+    // Better but requires normalized angle: (-0.30 * strength) + (normAngle * -1.1) - 7.9
+    float predictDistance = 0.0027f * powf(fabs(signalStrength) - 7.2f * normAngle, 2.02f);
+    return predictDistance;
+}
+#endif
 
 namespace {
     struct TextSwapchain {
@@ -219,6 +246,7 @@ namespace {
 
             bool exitRenderLoop = false;
 
+#ifdef PREDICT
             auto computeThread = std::thread([&] {
                 while (true) {
                     auto start = std::chrono::system_clock::now();
@@ -247,16 +275,26 @@ namespace {
 
                                         float totalDelta = 0;
                                         for (const auto& sample : samples) {
-                                            float voxelDist = XMVectorGetX(XMVector3Length(XMVectorSubtract(
-                                                xr::math::LoadXrVector3(voxelPos), xr::math::LoadXrVector3(sample.Position))));
+                                            const XMVECTOR samplePos = xr::math::LoadXrVector3(sample.Position);
+                                            // TODO: You are figuring out the math to get normalized direction toward the voxel from this sample.
+                                            auto cubeDirection =
+                                                XMVector3Normalize(XMVectorNegate(xr::math::LoadXrVector3(adapterInCube.pose.position)));
 
-                                            float predictDistance;
-                                            {
-                                                predictDistance = (-0.3f * sample.SignalStrength) - 7.9f;
-                                                predictDistance = predictDistance < 0 ? 0 : predictDistance;
-                                            }
+                                            // XMVECTORF32 wifiForward = { {{0, 0, 1}} };
+                                            // auto forwardDirection = XMVector3Rotate(wifiForward,
+                                            // xr::math::LoadXrQuaternion(adapterInCube.pose.orientation));
+                                            float cosAngle = XMVectorGetX(
+                                                XMVector3Dot(cubeDirection, xr::math::LoadXrVector3(sample.Forward))); // = cos(angle)
+                                            // Angle from back of headset, where wifi seems strongest,  0.0 (behind hololens) to 1.0 (180
+                                            // facing away).
+                                            float normAngle = acos(cosAngleFromCube) / 3.1415926f;
 
-                                            float predictOffset = fabs(predictDistance - voxelDist);
+                                            const float voxelDist = XMVectorGetX(
+                                                XMVector3Length(XMVectorSubtract(xr::math::LoadXrVector3(voxelPos), samplePos)));
+
+                                            const float predictDistance = PredictDistance(sample.SignalStrength, normAngle);
+
+                                            const float predictOffset = fabs(predictDistance - voxelDist);
                                             totalDelta += predictOffset;
                                         }
 
@@ -271,30 +309,29 @@ namespace {
 
                             std::vector<LocationGuess> localMinima;
 
-                            if (minScore != maxScore) {
+                            /*if (minScore != maxScore) {
                                 XMVECTOR avgPos = XMVectorSet(0, 0, 0, 0);
-                                int count = 0;
+                                float totalWeight = 0;
+                                const float scoreRange = maxScore - minScore;
                                 for (int x = 0; x < XCount; x++) {
                                     for (int y = 0; y < YCount; y++) {
                                         for (int z = 0; z < ZCount; z++) {
-                                            float weight = 1.0f - (guesses[x][y][z].Score - minScore) / (maxScore - minScore);
+                                            // ignore the 80% worst scores
+                                            if (guesses[x][y][z].Score > (minScore + (scoreRange * 0.1f))) {
+                                                continue;
+                                            }
+
+                                            float weight = 1.0f - ((guesses[x][y][z].Score - minScore) / scoreRange);
                                             avgPos = XMVectorAdd(avgPos,
                                                                  XMVectorScale(xr::math::LoadXrVector3(guesses[x][y][z].Position), weight));
-                                            count++;
+                                            totalWeight += weight;
                                         }
                                     }
                                 }
 
-                                //avgPos = XMVectorScale(avgPos, 1 / (float)count);
-                                localMinima.push_back({ {XMVectorGetX(avgPos), XMVectorGetY(avgPos), XMVectorGetZ(avgPos)}, 1.0f });
-                            }
-
-                            //#if 0
-                            /*
-                            get min and max cell value and normalize to that range, inverse (0 = worst, 1 = best)
-                            sum up all cell positions multiplied by inverse range
-                            multiply the final position by 1/count to get weighted average
-                            */
+                                avgPos = XMVectorScale(avgPos, 1 / (float)totalWeight);
+                                localMinima.push_back({{XMVectorGetX(avgPos), XMVectorGetY(avgPos), XMVectorGetZ(avgPos)}, 1.5f});
+                            }*/
 
                             // Find local minima
                             for (int x = 1; x < XCount - 1; x++) {
@@ -302,13 +339,13 @@ namespace {
                                     for (int z = 1; z < ZCount - 1; z++) {
                                         // TODO: Do diagonal neighbors too
                                         float me = guesses[x][y][z].Score;
-                                        if (me < guesses[x - 1][y][z].Score && me < guesses[x - 1][y - 1][z].Score &&
-                                            me < guesses[x - 1][y + 1][z].Score && me < guesses[x - 1][y][z - 1].Score &&
-                                            me < guesses[x - 1][y][z + 1].Score && me < guesses[x + 1][y][z].Score &&
-                                            me < guesses[x + 1][y - 1][z].Score && me < guesses[x + 1][y + 1][z].Score &&
-                                            me < guesses[x + 1][y][z - 1].Score && me < guesses[x + 1][y][z + 1].Score &&
-                                            me < guesses[x][y - 1][z].Score && me < guesses[x][y + 1][z].Score &&
-                                            me < guesses[x][y][z - 1].Score && me < guesses[x][y][z + 1].Score) {
+                                        if (me <= guesses[x - 1][y][z].Score && me <= guesses[x - 1][y - 1][z].Score &&
+                                            me <= guesses[x - 1][y + 1][z].Score && me <= guesses[x - 1][y][z - 1].Score &&
+                                            me <= guesses[x - 1][y][z + 1].Score && me <= guesses[x + 1][y][z].Score &&
+                                            me <= guesses[x + 1][y - 1][z].Score && me <= guesses[x + 1][y + 1][z].Score &&
+                                            me <= guesses[x + 1][y][z - 1].Score && me <= guesses[x + 1][y][z + 1].Score &&
+                                            me <= guesses[x][y - 1][z].Score && me <= guesses[x][y + 1][z].Score &&
+                                            me <= guesses[x][y][z - 1].Score && me <= guesses[x][y][z + 1].Score) {
                                             guesses[x][y][z].Score = 0.20f;
                                             localMinima.push_back(guesses[x][y][z]);
                                         }
@@ -319,7 +356,7 @@ namespace {
                             // Exclude any local minima that are too much worse than the best guess.
                             localMinima.erase(std::remove_if(localMinima.begin(),
                                                              localMinima.end(),
-                                                             [&](const auto& lm) { return lm.Score > minScore * 1.15f; }),
+                                                             [&](const auto& lm) { return lm.Score > minScore * 1.05f; }),
                                               localMinima.end());
                             //#endif
 
@@ -336,6 +373,7 @@ namespace {
                     ::Sleep(2000);
                 }
             });
+#endif
 
             bool requestRestart = false;
             do {
@@ -1012,6 +1050,7 @@ namespace {
                 }
             }
 
+#ifdef PREDICT
             // Render guesses locations.
             {
                 std::unique_lock lock(g_wirelessNetworksMutex);
@@ -1025,9 +1064,10 @@ namespace {
                     }
                 }
             }
+#endif
 
-            // I think this code isn't going to be needed beacuse signal strength dB does not appear to be true dB.
 #if 0
+            // I think this code isn't going to be needed beacuse signal strength dB does not appear to be true dB.
             // https://stackoverflow.com/questions/11217674/how-to-calculate-distance-from-wifi-router-using-signal-strength
             // instead of 27.55, use 37-40 (0-180 degree mapping)
             // instead of 10^ use 5^
@@ -1083,24 +1123,6 @@ namespace {
                     auto future = std::get<WiFiAdapter>(adapter).ScanAsync();
                 }
             }
-
-            // XrVector3f bestGuessPos;
-            // float bestGuessDiff = std::numeric_limits<float>::max();
-            /*
-            for (float x = -15; x <= 15; x++) {
-                for (float y = -15; y <= 15; y++) {
-                    for (float z = -15; z <= 15; z++) {
-                        XMVECTOR gridPos = XMVectorSet(x, y, z, 1);
-                        float dist = 0;
-                        for (const auto& sample : g_samples) {
-                            float distanceFromSample = gridPos - xr::math::LoadXrVector3(sample.Pos);
-                            float distanceDiff = abs(distanceFromSample - distanceEstimate);
-                            totalScore += distanceDiff;
-
-                        }
-                    }
-                }
-            }*/
 
             m_renderResources->ProjectionLayerViews.resize(viewCountOutput);
             if (m_optionalExtensions.DepthExtensionSupported) {
@@ -1170,6 +1192,18 @@ namespace {
                 sample.SignalStrength = (float)network.NetworkRssiInDecibelMilliwatts();
             }
 
+#if 0
+            if (network.Ssid() == L"Internets2") {
+                std::wstringstream row;
+                row << std::setprecision(4)
+                    << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
+                    << L"PreDist:" << PredictDistance((float)network.NetworkRssiInDecibelMilliwatts()) << std::endl
+                    << L"CTime:" << g_computeTime.count() << std::endl
+                    << L"Compute:" << g_computeCount << std::endl;
+
+                m_textSwapchain->UpdateText(row.str());
+            }
+#else
             int anchorId = 0;
             for (auto cube : m_placedCubes) {
                 if (anchorId == 0 && wirelessNetwork.Name != L"Internets") {
@@ -1194,24 +1228,22 @@ namespace {
                     XMVECTORF32 wifiForward = {{{0, 0, 1}}};
                     auto forwardDirection = XMVector3Rotate(wifiForward, xr::math::LoadXrQuaternion(adapterInCube.pose.orientation));
                     float cosAngleFromCube = XMVectorGetX(XMVector3Dot(cubeDirection, forwardDirection)); // = cos(angle)
-                    float angleFromCube = acos(cosAngleFromCube) / 3.1415926f * 180;
+                    float angleFromCube = acos(cosAngleFromCube) / 3.1415926f; // Angle from back of headset, where wifi seems strongest,
+                                                                               // 0.0 (behind hololens) to 1.0 (180 facing away).
 
                     ss << anchorId << std::setprecision(4) << L"," << adapterInCube.pose.position.x << L"," << adapterInCube.pose.position.y
                        << L"," << adapterInCube.pose.position.z << L"," << angleFromCube << L"," << network.Ssid().c_str() << L","
                        << network.NetworkRssiInDecibelMilliwatts() << L"," << (network.ChannelCenterFrequencyInKilohertz() / 1000) << L","
                        << std::endl;
 
-                    // negate(normalize(position)) is the direction to the ssid
-                    // adapterInCube.pose.orientation
-
-                    if (anchorId == 0 && network.Ssid() == L"Internets2") {
+                    if (anchorId == 0 && network.Ssid() == L"Internets") {
                         std::wstringstream row;
                         row << std::setprecision(4) << L"Ang:" << angleFromCube << std::endl
                             << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
-                            << L"Dist:" << XMVectorGetX(XMVector3Length(xr::math::LoadXrVector3(adapterInCube.pose.position))) << std::endl
-                            << L"Saves:" << g_saveCount << std::endl
-                            << L"CTime:" << g_computeTime.count() << std::endl
-                            << L"Compute:" << g_computeCount << std::endl;
+                            << L"PreDist:" << PredictDistance((float)network.NetworkRssiInDecibelMilliwatts()) << std::endl
+                            << L"Dist:   " << XMVectorGetX(XMVector3Length(xr::math::LoadXrVector3(adapterInCube.pose.position)))
+                            << std::endl
+                            << L"Saves:" << g_saveCount << std::endl;
 
                         m_textSwapchain->UpdateText(row.str());
                     }
@@ -1219,6 +1251,7 @@ namespace {
 
                 anchorId++;
             }
+#endif
         }
 
         void PrepareSessionRestart() {
