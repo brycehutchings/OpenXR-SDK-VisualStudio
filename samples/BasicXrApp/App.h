@@ -21,6 +21,7 @@ namespace xr::sample {
         XrSpace Space{XR_NULL_HANDLE};
         XrPosef Pose = xr::math::Pose::Identity();
         XrVector3f Scale{0.1f, 0.1f, 0.1f};
+        XrVector4f ColorScale{1,1,1,1};
     };
 
     struct IOpenXrProgram {

@@ -33,6 +33,7 @@ namespace {
         constexpr XrVector3f DarkGreen{0, 0.25f, 0};
         constexpr XrVector3f Blue{0, 0, 1};
         constexpr XrVector3f DarkBlue{0, 0, 0.25f};
+        constexpr XrVector3f White{ 1, 1, 1 };
 
         // Vertices for a 1x1x1 meter cube. (Left/Right, Top/Bottom, Front/Back)
         constexpr XrVector3f LBB{-0.5f, -0.5f, -0.5f};
@@ -47,12 +48,12 @@ namespace {
 #define CUBE_SIDE(V1, V2, V3, V4, V5, V6, COLOR) {V1, COLOR}, {V2, COLOR}, {V3, COLOR}, {V4, COLOR}, {V5, COLOR}, {V6, COLOR},
 
         constexpr Vertex c_cubeVertices[] = {
-            CUBE_SIDE(LTB, LBF, LBB, LTB, LTF, LBF, DarkRed)   // -X
-            CUBE_SIDE(RTB, RBB, RBF, RTB, RBF, RTF, Red)       // +X
-            CUBE_SIDE(LBB, LBF, RBF, LBB, RBF, RBB, DarkGreen) // -Y
-            CUBE_SIDE(LTB, RTB, RTF, LTB, RTF, LTF, Green)     // +Y
-            CUBE_SIDE(LBB, RBB, RTB, LBB, RTB, LTB, DarkBlue)  // -Z
-            CUBE_SIDE(LBF, LTF, RTF, LBF, RTF, RBF, Blue)      // +Z
+            CUBE_SIDE(LTB, LBF, LBB, LTB, LTF, LBF, Red)   // -X
+            CUBE_SIDE(RTB, RBB, RBF, RTB, RBF, RTF, White)       // +X
+            CUBE_SIDE(LBB, LBF, RBF, LBB, RBF, RBB, Green) // -Y
+            CUBE_SIDE(LTB, RTB, RTF, LTB, RTF, LTF, White)     // +Y
+            CUBE_SIDE(LBB, RBB, RTB, LBB, RTB, LTB, Blue)  // -Z
+            CUBE_SIDE(LBF, LTF, RTF, LBF, RTF, RBF, White)      // +Z
         };
 
         // Winding order is clockwise. Each side uses a different color.
@@ -66,6 +67,7 @@ namespace {
         };
 
         struct ModelConstantBuffer {
+            DirectX::XMFLOAT4 ColorScale;
             DirectX::XMFLOAT4X4 Model;
         };
 
@@ -77,14 +79,15 @@ namespace {
         constexpr char ShaderHlsl[] = R"_(
 			struct PSVertex {
 				float4 Pos : SV_POSITION;
-				float3 Color : COLOR0;
+				float4 Color : COLOR0;
 			};
 			struct Vertex {
 				float3 Pos : POSITION;
 				float3 Color : COLOR0;
 			};
 			cbuffer ModelConstantBuffer : register(b0) {
-				float4x4 Model;
+                float4 ColorScale : packoffset(c0);
+				float4x4 Model    : packoffset(c1);
 			};
 			cbuffer ViewProjectionConstantBuffer : register(b1) {
 				float4x4 ViewProjection;
@@ -93,12 +96,14 @@ namespace {
 			PSVertex MainVS(Vertex input) {
 			   PSVertex output;
 			   output.Pos = mul(mul(float4(input.Pos, 1), Model), ViewProjection);
-			   output.Color = input.Color;
+			   // output.Color = mul(float4(input.Color, 1), ColorScale);
+                output.Color = ColorScale;
+                // output.Color = input.Color;
 			   return output;
 			}
 
 			float4 MainPS(PSVertex input) : SV_TARGET {
-				return float4(input.Color, 1);
+				return input.Color;
 			}
 			)_";
 
@@ -246,6 +251,7 @@ namespace {
                 DirectX::XMStoreFloat4x4(&model.Model,
                                          DirectX::XMMatrixTranspose(DirectX::XMMatrixScaling(cube.Scale.x, cube.Scale.y, cube.Scale.z) *
                                                                     xr::math::LoadXrPose(cube.Pose)));
+                DirectX::XMStoreFloat4(&model.ColorScale, xr::math::LoadXrVector4(cube.ColorScale));
                 m_deviceContext->UpdateSubresource(m_modelCBuffer.get(), 0, nullptr, &model, 0, 0);
 
                 // Draw the cube.

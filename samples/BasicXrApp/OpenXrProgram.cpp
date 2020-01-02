@@ -58,6 +58,7 @@ struct SignalSample {
 struct LocationGuess {
     XrVector3f Position;
     float Score;
+    bool IsLocalMinima;
 };
 
 struct WirelessNetwork {
@@ -67,6 +68,8 @@ struct WirelessNetwork {
     }
     WirelessNetwork(WirelessNetwork&&) = default;
     WirelessNetwork& operator=(WirelessNetwork&&) = default;
+    WirelessNetwork(const WirelessNetwork&) = default;
+    WirelessNetwork& operator=(const WirelessNetwork&) = default;
 
     std::wstring Name;
     int Frequency;
@@ -81,6 +84,8 @@ std::chrono::milliseconds g_computeTime{};
 std::mutex g_wirelessNetworksMutex;
 std::map<winrt::hstring, WirelessNetwork> g_wirelessNetworks;
 
+constexpr float MinScore = 0.75f;
+
 #ifdef LINEAR // Linear is not so good at the 20-30db range.
 float PredictDistance(float signalStrength) {
     // Better but requires normalized angle: (-0.30 * strength) + (normAngle * -1.1) - 7.9
@@ -89,11 +94,24 @@ float PredictDistance(float signalStrength) {
     return predictDistance;
 }
 #endif
+
 #ifdef POWER
 float PredictDistance(float signalStrength, float normAngle) {
-    // Better but requires normalized angle: (-0.30 * strength) + (normAngle * -1.1) - 7.9
     float predictDistance = 0.0027f * powf(fabs(signalStrength) - 7.2f * normAngle, 2.02f);
     return predictDistance;
+}
+float GetScore(float signalStrength, float distanceDelta) {
+    // StdDev increases as signal strength weakens.
+    // Formula derived by using the PredictDistance (raw, not abs) function with real-world data, bucketed every 5db, and then
+    // using a linear regression because the variance looked mostly linear.
+    const float stdDev = std::max(0.25f, 0.05733f * fabs(signalStrength) - 0.87371f);
+
+    // Error function assumes 0.5 StdDev. Divide by actual "StdDev*Sqrt(2)" to
+    // Wikipedia: "When the results of a series of measurements are described by a normal distribution with standard deviation sigma
+    // and expected value 0, then erf(a / sigma*sqrt(2)) is the probability that the error of a single measurement lies between -a and +a,
+    // for positive a." Invert the value so that 0 distance is 1.0 and infinity distance is 0.0. Is this right? Also, I have no proof the
+    // distance delta follows a normal distribution. Perhaps error function/stddev is entirely wrong.
+    return 1.0f - erf(distanceDelta / (stdDev * 1.41421356237f));
 }
 #endif
 
@@ -248,14 +266,20 @@ namespace {
 
 #ifdef PREDICT
             auto computeThread = std::thread([&] {
+                ::SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+
                 while (true) {
                     auto start = std::chrono::system_clock::now();
                     {
-                        std::unique_lock mapLock(g_wirelessNetworksMutex);
-
                         // auto it = g_wirelessNetworks.find(L"18:d6:c7:87:60:66"); // Internets2
                         // if (it != g_wirelessNetworks.end()) {
-                        for (auto& wirelessNetworkPair : g_wirelessNetworks) {
+                        decltype(g_wirelessNetworks) wirelessNetworks;
+                        {
+                            std::unique_lock mapLock(g_wirelessNetworksMutex);
+                            wirelessNetworks = g_wirelessNetworks;
+                        }
+
+                        for (auto& wirelessNetworkPair : wirelessNetworks) {
                             WirelessNetwork& wirelessNetwork = wirelessNetworkPair.second;
 
                             std::vector<SignalSample> samples;
@@ -271,38 +295,38 @@ namespace {
                             for (int x = 0; x < XCount; x++) {
                                 for (int y = 0; y < YCount; y++) {
                                     for (int z = 0; z < ZCount; z++) {
-                                        const XrVector3f voxelPos = {x - (XCount / 2.0f), y - (YCount / 2.0f), z - (ZCount / 2.0f)};
+                                        const XMVECTOR voxelPos =
+                                            XMVectorSet(x - (XCount / 2.0f), y - (YCount / 2.0f), z - (ZCount / 2.0f), 0);
 
-                                        float totalDelta = 0;
+                                        float totalScore = 0;
                                         for (const auto& sample : samples) {
                                             const XMVECTOR samplePos = xr::math::LoadXrVector3(sample.Position);
-                                            // TODO: You are figuring out the math to get normalized direction toward the voxel from this sample.
-                                            auto cubeDirection =
-                                                XMVector3Normalize(XMVectorNegate(xr::math::LoadXrVector3(adapterInCube.pose.position)));
+                                            auto voxelDelta = XMVectorSubtract(voxelPos, samplePos);
+                                            auto voxelDirection = XMVector3Normalize(voxelDelta);
 
-                                            // XMVECTORF32 wifiForward = { {{0, 0, 1}} };
-                                            // auto forwardDirection = XMVector3Rotate(wifiForward,
-                                            // xr::math::LoadXrQuaternion(adapterInCube.pose.orientation));
-                                            float cosAngle = XMVectorGetX(
-                                                XMVector3Dot(cubeDirection, xr::math::LoadXrVector3(sample.Forward))); // = cos(angle)
+                                            // = cos(angle)
+                                            float voxelCosAngle =
+                                                XMVectorGetX(XMVector3Dot(voxelDirection, xr::math::LoadXrVector3(sample.Forward)));
                                             // Angle from back of headset, where wifi seems strongest,  0.0 (behind hololens) to 1.0 (180
                                             // facing away).
-                                            float normAngle = acos(cosAngleFromCube) / 3.1415926f;
+                                            float normAngle = acos(voxelCosAngle) / 3.1415926f;
 
-                                            const float voxelDist = XMVectorGetX(
-                                                XMVector3Length(XMVectorSubtract(xr::math::LoadXrVector3(voxelPos), samplePos)));
+                                            const float voxelDist = XMVectorGetX(XMVector3Length(voxelDelta));
 
                                             const float predictDistance = PredictDistance(sample.SignalStrength, normAngle);
 
                                             const float predictOffset = fabs(predictDistance - voxelDist);
-                                            totalDelta += predictOffset;
+                                            const float score = GetScore(sample.SignalStrength, predictOffset);
+                                            totalScore += log(1 - score) - log(score);
                                         }
 
-                                        guesses[x][y][z].Position = voxelPos;
-                                        guesses[x][y][z].Score = totalDelta;
+                                        totalScore = 1 / (1 + exp(totalScore));
 
-                                        minScore = std::min(minScore, totalDelta);
-                                        maxScore = std::max(maxScore, totalDelta);
+                                        xr::math::StoreXrVector3(&guesses[x][y][z].Position, voxelPos);
+                                        guesses[x][y][z].Score = totalScore;
+
+                                        minScore = std::min(minScore, totalScore);
+                                        maxScore = std::max(maxScore, totalScore);
                                     }
                                 }
                             }
@@ -337,32 +361,49 @@ namespace {
                             for (int x = 1; x < XCount - 1; x++) {
                                 for (int y = 1; y < YCount - 1; y++) {
                                     for (int z = 1; z < ZCount - 1; z++) {
-                                        // TODO: Do diagonal neighbors too
                                         float me = guesses[x][y][z].Score;
-                                        if (me <= guesses[x - 1][y][z].Score && me <= guesses[x - 1][y - 1][z].Score &&
-                                            me <= guesses[x - 1][y + 1][z].Score && me <= guesses[x - 1][y][z - 1].Score &&
-                                            me <= guesses[x - 1][y][z + 1].Score && me <= guesses[x + 1][y][z].Score &&
-                                            me <= guesses[x + 1][y - 1][z].Score && me <= guesses[x + 1][y + 1][z].Score &&
-                                            me <= guesses[x + 1][y][z - 1].Score && me <= guesses[x + 1][y][z + 1].Score &&
-                                            me <= guesses[x][y - 1][z].Score && me <= guesses[x][y + 1][z].Score &&
-                                            me <= guesses[x][y][z - 1].Score && me <= guesses[x][y][z + 1].Score) {
-                                            guesses[x][y][z].Score = 0.20f;
-                                            localMinima.push_back(guesses[x][y][z]);
+                                        if (me == 0) {
+                                            continue;
+                                        }
+
+                                        // TODO: Do diagonal neighbors too
+                                        int lowerCount = 0;
+                                        lowerCount += (me >= guesses[x - 1][y][z].Score);
+                                        lowerCount += (me >= guesses[x + 1][y][z].Score);
+                                        lowerCount += (me >= guesses[x][y - 1][z].Score);
+                                        lowerCount += (me >= guesses[x][y + 1][z].Score);
+                                        lowerCount += (me >= guesses[x][y][z - 1].Score);
+                                        lowerCount += (me >= guesses[x][y][z + 1].Score);
+
+                                        /*&& me <= guesses[x - 1][y - 1][z].Score &&
+                                        me <= guesses[x - 1][y + 1][z].Score && me <= guesses[x - 1][y][z - 1].Score &&
+                                        me <= guesses[x - 1][y][z + 1].Score && me <= guesses[x + 1][y][z].Score &&
+                                        me <= guesses[x + 1][y - 1][z].Score && me <= guesses[x + 1][y + 1][z].Score &&
+                                        me <= guesses[x + 1][y][z - 1].Score && me <= guesses[x + 1][y][z + 1].Score &&
+                                        me <= guesses[x][y - 1][z].Score && me <= guesses[x][y + 1][z].Score &&
+                                        me <= guesses[x][y][z - 1].Score && me <= guesses[x][y][z + 1].Score) {*/
+                                        if (me > MinScore || lowerCount == 6) {
+                                            LocationGuess guess2 = guesses[x][y][z];
+                                            guess2.Score = me;
+                                            guess2.IsLocalMinima = lowerCount == 6;
+                                            localMinima.push_back(guess2);
                                         }
                                     }
                                 }
                             }
 
-                            // Exclude any local minima that are too much worse than the best guess.
-                            localMinima.erase(std::remove_if(localMinima.begin(),
-                                                             localMinima.end(),
-                                                             [&](const auto& lm) { return lm.Score > minScore * 1.05f; }),
-                                              localMinima.end());
                             //#endif
+                            wirelessNetwork.Guesses = std::move(localMinima);
+                        }
 
-                            {
-                                // std::unique_lock lock(g_wirelessNetworksMutex);
-                                wirelessNetwork.Guesses = std::move(localMinima);
+                        {
+                            std::unique_lock mapLock(g_wirelessNetworksMutex);
+
+                            for (auto& wirelessNetwork : g_wirelessNetworks) {
+                                auto it = wirelessNetworks.find(wirelessNetwork.first);
+                                if (it != std::end(wirelessNetworks)) {
+                                    wirelessNetwork.second.Guesses = std::move(it->second.Guesses);
+                                }
                             }
                         }
 
@@ -1045,6 +1086,7 @@ namespace {
                         cube.Scale = {0.02f, 0.02f, 0.02f};
                         cube.Pose.orientation = {0, 0, 0, 1};
                         cube.Pose.position = sample.Position;
+                        cube.ColorScale = {0, 0, 1, 1};
                         visibleCubes.push_back(cube);
                     }
                 }
@@ -1057,9 +1099,24 @@ namespace {
                 for (const auto& wirelessNetwork : g_wirelessNetworks) {
                     for (const auto& guess : wirelessNetwork.second.Guesses) {
                         xr::sample::Cube cube;
-                        cube.Scale = {guess.Score, guess.Score, guess.Score};
                         cube.Pose.orientation = {0, 0, 0, 1};
                         cube.Pose.position = guess.Position;
+
+                        float normScore = (guess.Score - MinScore) / (1 - MinScore);
+                        if (normScore < 0) {
+                            cube.ColorScale = {0.25f, 0, 0, 1};
+                        } else if (normScore < 0.5f) {
+                            cube.ColorScale = {0.5f, (normScore / 0.5f) / 2, 0, 1};
+                        } else {
+                            cube.ColorScale = {(1 - ((normScore - 0.5f) / 0.5f)) / 2, 0.5f, 0, 1};
+                        }
+
+                        if (guess.IsLocalMinima) {
+                            cube.Scale = {0.33f, 0.33f, 0.33f};
+                        } else {
+                            cube.Scale = {0.1f, 0.1f, 0.1f};
+                        }
+
                         visibleCubes.push_back(cube);
                     }
                 }
@@ -1105,7 +1162,7 @@ namespace {
                             networkDisplayName = network.Bssid().c_str();
                         }
 
-                        if (networkDisplayName != L"Internets" && networkDisplayName != L"Internets2") {
+                        if (networkDisplayName != L"Internets2") {
                             continue;
                         }
 
@@ -1188,17 +1245,30 @@ namespace {
             CHECK_XRCMD(xrLocateSpace(m_wifiAdapterSpace.Get(), m_sceneSpace.Get(), predictedDisplayTime, &adapterInScene));
             if (xr::math::Pose::IsPoseValid(adapterInScene)) {
                 auto& sample = wirelessNetwork.Samples.emplace_back();
+
+                constexpr XMVECTORF32 wifiForward = {{{0, 0, 1}}};
+
+                xr::math::StoreXrVector3(&sample.Forward,
+                                         XMVector3Rotate(wifiForward, xr::math::LoadXrQuaternion(adapterInScene.pose.orientation)));
                 sample.Position = adapterInScene.pose.position;
                 sample.SignalStrength = (float)network.NetworkRssiInDecibelMilliwatts();
+
+                // Keep sample count to last 25 for performance and in theory better accuracy as user approaches correct point
+                if (wirelessNetwork.Samples.size() > 25) {
+                    wirelessNetwork.Samples.erase(wirelessNetwork.Samples.begin());
+                }
             }
 
-#if 0
+#if 1
             if (network.Ssid() == L"Internets2") {
                 std::wstringstream row;
-                row << std::setprecision(4)
-                    << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
-                    << L"PreDist:" << PredictDistance((float)network.NetworkRssiInDecibelMilliwatts()) << std::endl
+                row << std::setprecision(4) << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
+                    << L"PreDist0:" << PredictDistance((float)network.NetworkRssiInDecibelMilliwatts(), 0) << std::endl
+                    << L"PreDist1:" << PredictDistance((float)network.NetworkRssiInDecibelMilliwatts(), 1) << std::endl
+                    << L"Score1:" << GetScore((float)network.NetworkRssiInDecibelMilliwatts(), 1) << std::endl
+                    << L"Score2:" << GetScore((float)network.NetworkRssiInDecibelMilliwatts(), 2) << std::endl
                     << L"CTime:" << g_computeTime.count() << std::endl
+                    << L"Count:" << wirelessNetwork.Samples.size() << std::endl
                     << L"Compute:" << g_computeCount << std::endl;
 
                 m_textSwapchain->UpdateText(row.str());
@@ -1240,7 +1310,8 @@ namespace {
                         std::wstringstream row;
                         row << std::setprecision(4) << L"Ang:" << angleFromCube << std::endl
                             << L"dB:" << network.NetworkRssiInDecibelMilliwatts() << std::endl
-                            << L"PreDist:" << PredictDistance((float)network.NetworkRssiInDecibelMilliwatts()) << std::endl
+                            << L"PreDistMin:" << PredictDistance((float)network.NetworkRssiInDecibelMilliwatts(), 0) << std::endl
+                            << L"PreDistMax:" << PredictDistance((float)network.NetworkRssiInDecibelMilliwatts(), 1) << std::endl
                             << L"Dist:   " << XMVectorGetX(XMVector3Length(xr::math::LoadXrVector3(adapterInCube.pose.position)))
                             << std::endl
                             << L"Saves:" << g_saveCount << std::endl;
@@ -1337,7 +1408,7 @@ namespace {
 
         bool m_sessionRunning{false};
         XrSessionState m_sessionState{XR_SESSION_STATE_UNKNOWN};
-    };
+    }; // namespace
 } // namespace
 
 namespace xr::sample {
